@@ -1,0 +1,777 @@
+from contextlib import suppress
+from functools import cached_property
+from itertools import chain
+
+import numpy as np
+
+from devito.ir.equations import ClusterizedEq
+from devito.ir.support import (
+    PARALLEL, PARALLEL_IF_PVT, BaseGuardBoundNext, DataSpace, Forward, Guards, Interval,
+    IntervalGroup, IterationSpace, PrefetchUpdate, Properties, Scope, WaitLock, WithLock,
+    detect_accesses, maximum, minimum, normalize_properties, normalize_syncs, null_ispace,
+    tailor_properties, update_properties
+)
+from devito.mpi.halo_scheme import HaloScheme, HaloTouch
+from devito.mpi.reduction_scheme import DistReduce
+from devito.symbolics import estimate_cost, uxreplace
+from devito.tools import (
+    CacheInstances, as_tuple, cached_hash, filter_ordered, flatten, infer_dtype
+)
+from devito.types import (
+    CriticalRegion, Fence, Indexed, PhaseMarker, TensorMove, ThreadArrive, ThreadCommit,
+    ThreadPoolSync, ThreadWait, WeakFence
+)
+
+__all__ = ["Cluster", "ClusterGroup"]
+
+
+class EqBlock(CacheInstances):
+
+    """
+    A sequence of equations with associated metadata.
+    """
+
+    @classmethod
+    def _preprocess_args(cls, exprs, ispace=null_ispace, guards=None,
+                         properties=None, syncs=None, halo_scheme=None):
+        exprs = tuple(ClusterizedEq(e, ispace=ispace) for e in as_tuple(exprs))
+        guards = Guards(guards or {})
+        properties = Properties(properties or {})
+        syncs = normalize_syncs(syncs or {})
+
+        return (exprs, ispace, guards, properties, syncs, halo_scheme), {}
+
+    def __init__(self, exprs, ispace=null_ispace, guards=None, properties=None,
+                 syncs=None, halo_scheme=None):
+        self._exprs = exprs
+        self._ispace = ispace
+        self._guards = guards
+        self._syncs = syncs
+        self._halo_scheme = halo_scheme
+
+        properties = tailor_properties(properties, ispace)
+        self._properties = update_properties(properties, self._exprs)
+
+    def __eq__(self, other):
+        return (type(self) is type(other) and
+                self.exprs == other.exprs and
+                self.ispace == other.ispace and
+                self.guards == other.guards and
+                self.properties == other.properties and
+                self.syncs == other.syncs and
+                self.halo_scheme == other.halo_scheme)
+
+    def __hash__(self):
+        return hash((self.exprs, self.ispace, self.guards, self.properties,
+                     self.syncs, self.halo_scheme))
+
+    @property
+    def exprs(self):
+        return self._exprs
+
+    @property
+    def ispace(self):
+        return self._ispace
+
+    @property
+    def itintervals(self):
+        return self.ispace.itintervals
+
+    @property
+    def sub_iterators(self):
+        return self.ispace.sub_iterators
+
+    @property
+    def directions(self):
+        return self.ispace.directions
+
+    @property
+    def guards(self):
+        return self._guards
+
+    @property
+    def properties(self):
+        return self._properties
+
+    @property
+    def syncs(self):
+        return self._syncs
+
+    @property
+    def halo_scheme(self):
+        return self._halo_scheme
+
+    @cached_property
+    def free_symbols(self):
+        return set().union(*[e.free_symbols for e in self.exprs])
+
+    @cached_property
+    def dimensions(self):
+        return set().union(*[i._defines for i in self.ispace.dimensions])
+
+    @cached_property
+    def exprs_dimensions(self):
+        """
+        The Dimensions that appear explicitly in the expressions.
+        """
+        dims_explicit = {i for i in self.free_symbols if i.is_Dimension}
+        dims_implicit = {d for e in self.exprs for d in e.implicit_dims}
+        return dims_explicit | dims_implicit
+
+    @property
+    def guards_dimensions(self):
+        """
+        The Dimensions that appear explicitly in the guards.
+        """
+        return self.guards.dimensions
+
+    @cached_property
+    def used_dimensions(self):
+        """
+        All the Dimensions that appear explicitly either within the expressions
+        or the guards.
+
+        Note that, in some cases, some of the IterationSpace Dimensions might
+        not appear here among the used Dimensions -- for example, reduction or
+        redundant (i.e., invariant) Dimensions.
+        """
+        return self.exprs_dimensions | self.guards_dimensions
+
+    @cached_property
+    def dist_dimensions(self):
+        """
+        The distributed Dimensions.
+        """
+        ret = set()
+        for f in self.functions:
+            with suppress(AttributeError):
+                ret.update(f._dist_dimensions)
+        return frozenset(ret)
+
+    @cached_property
+    def local_sums(self):
+        """
+        The local sums in equation order, retaining occurrences across equations.
+        """
+        return tuple(s for e in self.exprs for s in e.local_sums)
+
+    @cached_property
+    def scope(self):
+        return Scope(self.exprs)
+
+    @cached_property
+    def functions(self):
+        return self.scope.functions
+
+    @cached_property
+    def grid(self):
+        grids = set(f.grid for f in self.functions if f.is_AbstractFunction)
+        grids.discard(None)
+        grids = {g.root for g in grids}
+        if len(grids) == 0:
+            return None
+        elif len(grids) == 1:
+            return grids.pop()
+        else:
+            raise ValueError("Multiple Grids detected")
+
+    @cached_property
+    def is_scalar(self):
+        return not any(f.is_Function for f in self.scope.writes)
+
+    @cached_property
+    def is_dense(self):
+        """
+        True if at least one of the following conditions are True:
+
+            * It is defined over a unique Grid and all of the Grid Dimensions
+              are PARALLEL.
+            * Only DiscreteFunctions are written and only affine index functions
+              are used (e.g., `a[x+1, y-2]` is OK, while `a[b[x], y-2]` is not)
+
+        False in all other cases.
+        """
+        # Hopefully it's got a unique Grid and all Dimensions are PARALLEL (or
+        # at most PARALLEL_IF_PVT). This is a quick and easy check so we try it first
+        try:
+            pset = {PARALLEL, PARALLEL_IF_PVT}
+            target = set(self.grid.dimensions)
+            dims = {d for d in self.properties if d._defines & target}
+            if any(pset & self.properties[d] for d in dims):
+                return True
+        except (AttributeError, ValueError):
+            pass
+
+        # Fallback to legacy is_dense checks
+        return (not any(e.conditionals for e in self.exprs) and
+                not any(f.is_SparseFunction for f in self.functions) and
+                not self.is_wild and
+                all(a.is_regular for a in self.scope.accesses))
+
+    @cached_property
+    def is_sparse(self):
+        """
+        True if it represents a sparse operation, i.e iff there's at least
+        one irregular access, False otherwise.
+        """
+        return any(a.is_irregular for a in self.scope.accesses)
+
+    @cached_property
+    def is_wild(self):
+        """
+        True if encoding a non-mathematical operation, False otherwise.
+        """
+        return (self.is_halo_touch or
+                self.is_dist_reduce or
+                self.is_weak_fence or
+                self.is_critical_region)
+
+    def _is_type(self, cls):
+        return self.exprs and all(isinstance(e.rhs, cls) for e in self.exprs)
+
+    @cached_property
+    def is_halo_touch(self):
+        return self._is_type(HaloTouch)
+
+    @cached_property
+    def is_dist_reduce(self):
+        return self._is_type(DistReduce)
+
+    @cached_property
+    def is_fence(self):
+        return self._is_type(Fence) or self.is_critical_region
+
+    @cached_property
+    def is_weak_fence(self):
+        return self._is_type(WeakFence)
+
+    @cached_property
+    def is_phase_marker(self):
+        return self._is_type(PhaseMarker)
+
+    @cached_property
+    def is_critical_region(self):
+        return self._is_type(CriticalRegion)
+
+    @cached_property
+    def is_thread_rendezvous(self):
+        """
+        True if it contains a synchronization point at which all participating
+        threads must arrive before any may proceed.
+        """
+        return self.is_thread_pool_sync and not self.is_thread_wait
+
+    @cached_property
+    def is_thread_pool_sync(self):
+        return self._is_type(ThreadPoolSync)
+
+    @cached_property
+    def is_shm_write(self):
+        return all(w._mem_shared for w in self.scope.writes)
+
+    @cached_property
+    def is_thread_commit(self):
+        return self._is_type(ThreadCommit)
+
+    @cached_property
+    def is_thread_arrive(self):
+        return self._is_type(ThreadArrive)
+
+    @cached_property
+    def is_thread_wait(self):
+        return self._is_type(ThreadWait)
+
+    @cached_property
+    def is_thread_sync(self):
+        return self.is_thread_pool_sync or self.is_thread_wait
+
+    @cached_property
+    def is_word_move(self):
+        return (self._is_type(Indexed) and
+                all(e.rhs.function._mem_heap for e in self.exprs))
+
+    @cached_property
+    def is_tensor_move(self):
+        return self._is_type(TensorMove)
+
+    @cached_property
+    def is_word_move_to_mem_shared(self):
+        return self.is_word_move and self.is_shm_write
+
+    @cached_property
+    def is_tensor_move_to_mem_shared(self):
+        return self.is_tensor_move and self.is_shm_write
+
+    @cached_property
+    def is_glb_load_to_mem_shared(self):
+        return self.is_word_move_to_mem_shared or self.is_tensor_move_to_mem_shared
+
+    @cached_property
+    def is_async(self):
+        """
+        True if asynchronous, False otherwise.
+        """
+        return any(isinstance(s, (WithLock, PrefetchUpdate))
+                   for s in flatten(self.syncs.values()))
+
+    @cached_property
+    def is_wait(self):
+        """
+        True if waiting on a lock (that is a special synchronization operation),
+        False otherwise.
+        """
+        return any(isinstance(s, WaitLock)
+                   for s in flatten(self.syncs.values()))
+
+    @cached_property
+    def dtype(self):
+        """
+        The arithmetic data type of the enclosed expressions.
+
+        If two expressions perform calculations with different precision, the data
+        type with highest precision is returned.
+        """
+        dtypes = set()
+        for i in self.exprs:
+            try:
+                if np.issubdtype(i.dtype, np.generic):
+                    dtypes.add(i.dtype)
+            except TypeError:
+                # E.g. `i.dtype` is a ctypes pointer, which has no dtype equivalent
+                pass
+
+        return infer_dtype(dtypes)
+
+    @cached_property
+    def dspace(self):
+        """
+        The DataSpace deriving from the enclosed expressions, IterationSpace,
+        and Guards.
+        """
+        accesses = detect_accesses(self.exprs)
+
+        # Construct the `parts` of the DataSpace, that is a projection of the data
+        # space for each Function appearing in `self.exprs`
+        parts = {}
+        for f, v in accesses.items():
+            if f is None:
+                continue
+
+            intervals = [Interval(d,
+                                  min([minimum(i, ispace=self.ispace) for i in o]),
+                                  max([maximum(i, ispace=self.ispace) for i in o]))
+                         for d, o in v.items()]
+            intervals = IntervalGroup(intervals)
+
+            # Factor in the IterationSpace -- if the min/max points aren't zero,
+            # then the data intervals need to shrink/expand accordingly
+            intervals = intervals.promote(lambda d: d.is_Block)
+            shift = self.ispace.intervals.promote(lambda d: d.is_Block)
+            intervals = intervals.add(shift)
+
+            # Map SubIterators to the corresponding data space Dimension
+            # E.g., `xs -> x -> x0_blk0 -> x` or `t0 -> t -> time`
+            intervals = intervals.promote(lambda d: d.is_SubIterator)
+
+            # If the bound of a Dimension is explicitly guarded, then we should
+            # shrink the `parts` accordingly
+            for d, v in self.guards.items():
+                ret = v.find(BaseGuardBoundNext)
+                assert len(ret) <= 1
+                if len(ret) != 1:
+                    continue
+                if ret.pop().direction is Forward:
+                    intervals = intervals.translate(d._defines, v1=-1)
+                else:
+                    intervals = intervals.translate(d._defines, 1)
+            for d in self.properties:
+                if self.properties.is_inbound(d):
+                    intervals = intervals.zero(d._defines)
+
+            # Special case: if the factor of a ConditionalDimension has value 1,
+            # then we can safely resort to the parent's Interval
+            key = lambda d: d.is_Conditional and d.condition is None and d.factor == 1
+            intervals = intervals.promote(key)
+
+            parts[f] = intervals
+
+        # Determine the Dimensions requiring shifted min/max points to avoid
+        # OOB accesses
+        oobs = set()
+        for f, v in parts.items():
+            for i in v:
+                d = i.dim.parent if i.dim.is_Sub else i.dim
+                try:
+                    if i.lower < 0 or \
+                       i.upper > f._size_nodomain[d].left + f._size_halo[d].right:
+                        # It'd mean trying to access a point before the
+                        # left halo (test0) or after the right halo (test1)
+                        oobs.update(d._defines)
+                except (KeyError, TypeError):
+                    # Unable to detect presence of OOB accesses (e.g., `d` not in
+                    # `f._size_halo`, that is typical of indirect accesses `A[B[i]]`)
+                    pass
+
+        # Construct the `intervals` of the DataSpace, that is a global,
+        # Dimension-centric view of the data space
+        intervals = IntervalGroup.generate('union', *parts.values())
+
+        # E.g., `db0 -> time`, but `xi NOT-> x`
+        intervals = intervals.promote(lambda d: not d.is_Sub)
+        intervals = intervals.zero(set(intervals.dimensions) - oobs)
+
+        return DataSpace(intervals, parts)
+
+    @cached_property
+    def ops(self):
+        """Number of operations performed at each iteration."""
+        return sum(estimate_cost(i) for i in self.exprs)
+
+    @cached_property
+    def traffic(self):
+        """
+        The compulsory traffic (number of reads/writes), as a mapper from
+        Functions to IntervalGroups.
+
+        Notes
+        -----
+        If a Function is both read and written, then it is counted twice.
+        """
+        reads = flatten(i.read_functions_relaxed for i in self.exprs)
+        writes = flatten(i.write_functions_relaxed for i in self.exprs)
+        accesses = [(i, 'r') for i in reads] + [(i, 'w') for i in writes]
+
+        # Ordering isn't important at this point, so returning an unordered
+        # collection makes the caller's life easier
+        uispace = self.ispace.reorder(mode='unordered')
+
+        ret = {}
+        for i, mode in accesses:
+            if not i.is_AbstractFunction:
+                continue
+            elif i in self.dspace.parts:
+                # Stencils extend the data spaces beyond the iteration spaces
+                intervals = self.dspace.parts[i]
+
+                # Assume that invariant dimensions always cause new loads/stores
+                invariants = uispace.intervals.drop(intervals.dimensions)
+
+                intervals = intervals.generate('union', invariants, intervals)
+
+                # Bundles impact depends on the number of components
+                try:
+                    v = len(i.components)
+                except AttributeError:
+                    v = 1
+
+                for n in range(v):
+                    ret[(i, mode, n)] = intervals
+            else:
+                ret[(i, mode, 0)] = uispace.intervals
+
+        return ret
+
+
+class Cluster:
+
+    """
+    A context-sensitive sequence of equations.
+
+    The structural payload (equations, IterationSpace, ...) lives in the
+    underlying EqBlock. A Cluster, unlike EqBlock, deliberately keeps identity
+    semantics because its position in a sequence of Clusters does matter.  It
+    follows that two Cluster instances may share the same EqBlock, but they
+    remain distinct: Clusters intentionally use object identity for equality
+    and hashing, so only references to the same Cluster object compare equal.
+
+    Parameters
+    ----------
+    exprs : expr-like or list of expr-like
+        An ordered sequence of expressions computing a tensor.
+    ispace : IterationSpace, optional
+        The Cluster iteration space.
+    guards : dict, optional
+        Mapper from Dimensions to expr-like, representing the conditions under
+        which the Cluster should be computed.
+    properties : dict, optional
+        Mapper from Dimensions to Property, describing the Cluster properties
+        such as its parallel Dimensions.
+    syncs : dict, optional
+        Mapper from Dimensions to lists of SyncOps, that is ordered sequences of
+        synchronization operations that must be performed in order to compute the
+        Cluster asynchronously.
+    halo_scheme : HaloScheme, optional
+        The halo exchanges required by the Cluster.
+    """
+
+    def __init__(self, exprs, ispace=null_ispace, guards=None, properties=None,
+                 syncs=None, halo_scheme=None):
+        self._block = EqBlock(exprs, ispace, guards, properties, syncs, halo_scheme)
+
+    def __repr__(self):
+        return "Cluster([{}])".format(('\n' + ' '*9).join(f'{i}' for i in self.exprs))
+
+    def __getattr__(self, name):
+        try:
+            block = object.__getattribute__(self, '_block')
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(block, name)
+
+    @classmethod
+    def from_clusters(cls, *clusters):
+        """
+        Build a new Cluster from a sequence of pre-existing Clusters with
+        compatible IterationSpace.
+        """
+        assert len(clusters) > 0
+        root = clusters[0]
+
+        if len(clusters) == 1:
+            return root
+
+        if not all(root.ispace.is_compatible(c.ispace) for c in clusters):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "incompatible IterationSpace")
+        if not all(root.guards == c.guards for c in clusters):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "non-homogeneous guards")
+        if not all(root.dtype == c.dtype for c in clusters):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "non-homogeneous data types")
+
+        writes = set().union(*[c.scope.writes for c in clusters])
+        reads = set().union(*[c.scope.reads for c in clusters])
+        if any(f._mem_shared for f in writes & reads):
+            raise ValueError("Cannot build a Cluster from Clusters with "
+                             "read-write conflicts on shared-memory Functions")
+
+        exprs = chain(*[c.exprs for c in clusters])
+        ispace = IterationSpace.union(*[c.ispace for c in clusters])
+
+        guards = root.guards
+
+        properties = reduce_properties(clusters)
+
+        try:
+            syncs = normalize_syncs(*[c.syncs for c in clusters])
+        except ValueError as e:
+            raise ValueError(
+                "Cannot build a Cluster from Clusters with "
+                "non-compatible synchronization operations"
+            ) from e
+
+        halo_scheme = HaloScheme.union([c.halo_scheme for c in clusters])
+
+        return Cluster(exprs, ispace, guards, properties, syncs, halo_scheme)
+
+    def rebuild(self, *args, **kwargs):
+        """
+        Build a new Cluster from the attributes given as keywords. All other
+        attributes are taken from ``self``.
+        """
+        # Shortcut for backwards compatibility
+        if args:
+            if len(args) != 1:
+                raise ValueError("rebuild takes at most one positional argument (exprs)")
+            if kwargs.get('exprs'):
+                raise ValueError("`exprs` provided both as arg and kwarg")
+            kwargs['exprs'] = args[0]
+
+        exprs = kwargs.get('exprs', self.exprs)
+        ispace = kwargs.get('ispace', self.ispace)
+        guards = kwargs.get('guards', self.guards)
+        properties = kwargs.get('properties', self.properties)
+        syncs = kwargs.get('syncs', self.syncs)
+        halo_scheme = kwargs.get('halo_scheme', self.halo_scheme)
+
+        if exprs is self.exprs and \
+           ispace is self.ispace and \
+           guards is self.guards and \
+           properties is self.properties and \
+           syncs is self.syncs and \
+           halo_scheme is self.halo_scheme:
+            return self
+
+        return self.__class__(exprs=exprs,
+                              ispace=ispace,
+                              guards=guards,
+                              properties=properties,
+                              syncs=syncs,
+                              halo_scheme=halo_scheme)
+
+    def subs(self, mapper, compact=()):
+        """
+        Build a new Cluster applying substitutions rules to `self`.
+        """
+        if not mapper:
+            return self
+
+        if self.halo_scheme:
+            raise NotImplementedError
+
+        key0 = lambda i: i.is_Block
+        subs0 = {d: self.ispace[d].promote(key0).dim for d in compact}
+
+        subs = {**mapper, **subs0}
+        exprs = [uxreplace(e, subs) for e in self.exprs]
+
+        ispace = self.ispace.switch(mapper)
+        key = lambda i: key0(i) and i in flatten(d._defines for d in subs0)
+        ispace = ispace.promote(key, mode='total')
+
+        guards = self.guards.subs(mapper).promote(subs0)
+        properties = self.properties.subs(mapper).promote(subs0)
+        syncs = self.syncs.subs(mapper)
+
+        return self.__class__(exprs=exprs, ispace=ispace, guards=guards,
+                              properties=properties, syncs=syncs)
+
+
+class ClusterGroup(tuple):
+
+    """
+    An immutable, totally-ordered sequence of Clusters.
+
+    Parameters
+    ----------
+    clusters : tuple of Clusters
+        Input elements.
+    ispace : IterationSpace, optional
+        The IterationSpace section shared by all `clusters`.
+    """
+
+    def __new__(cls, clusters, ispace=None):
+        obj = super().__new__(cls, flatten(as_tuple(clusters)))
+
+        if ispace is not None:
+            obj._ispace = ispace
+        else:
+            # Best effort attempt to infer a common IterationSpace
+            try:
+                obj._ispace, = {c.ispace for c in obj}
+            except ValueError:
+                obj._ispace = None
+
+        return obj
+
+    def __eq__(self, other):
+        return (isinstance(other, ClusterGroup) and
+                super().__eq__(other) and
+                self._ispace == other._ispace)
+
+    def __ne__(self, other):
+        return not self == other
+
+    @cached_hash
+    def __hash__(self):
+        return hash((tuple(self), self._ispace))
+
+    @classmethod
+    def concatenate(cls, *cgroups):
+        return list(chain(*cgroups))
+
+    def rebuild(self, **kwargs):
+        clusters = kwargs.get('clusters', self)
+        ispace = kwargs.get('ispace', self.ispace)
+
+        return self.__class__(clusters, ispace=ispace)
+
+    @cached_property
+    def exprs(self):
+        return flatten(c.exprs for c in self)
+
+    @cached_property
+    def local_sums(self):
+        return tuple(s for c in self for s in c.local_sums)
+
+    @cached_property
+    def scope(self):
+        return Scope(exprs=self.exprs)
+
+    @cached_property
+    def functions(self):
+        return self.scope.functions
+
+    @cached_property
+    def ispace(self):
+        return self._ispace
+
+    @cached_property
+    def properties(self):
+        return tailor_properties(reduce_properties(self), self.ispace)
+
+    @cached_property
+    def guards(self):
+        """
+        A view of the ClusterGroup's guards.
+        """
+        return tuple(filter_ordered(i.guards for i in self))
+
+    @cached_property
+    def syncs(self):
+        """
+        A view of the ClusterGroup's synchronization operations.
+        """
+        return normalize_syncs(*[c.syncs for c in self], strict=False)
+
+    @cached_property
+    def dspace(self):
+        """Return the DataSpace of this ClusterGroup."""
+        return DataSpace.union(*[i.dspace.reset() for i in self])
+
+    @cached_property
+    def is_dense(self):
+        return all(i.is_dense for i in self)
+
+    @cached_property
+    def is_wild(self):
+        return all(i.is_wild for i in self)
+
+    @cached_property
+    def is_halo_touch(self):
+        return all(i.is_halo_touch for i in self)
+
+    @cached_property
+    def is_glb_load_to_mem_shared(self):
+        return all(i.is_glb_load_to_mem_shared for i in self)
+
+    @cached_property
+    def dtype(self):
+        """
+        The arithmetic data type of this ClusterGroup.
+
+        If at least one Cluster performs floating point arithmetic, then the
+        Clusters performing integer arithmetic are ignored.
+
+        If two Clusters perform calculations with different precision, the
+        data type with highest precision is returned.
+        """
+        dtypes = {i.dtype for i in self} - {None}
+
+        return infer_dtype(dtypes)
+
+    @cached_property
+    def meta(self):
+        """
+        Returns
+        -------
+        dtype, DSpace
+            The data type and the data space of the ClusterGroup.
+        """
+        return (self.dtype, self.dspace)
+
+
+# *** Utils
+
+def reduce_properties(clusters):
+    """
+    The normalized intersection (basically, a reduction) of the Properties in
+    `clusters`.
+    """
+    properties = {}
+    for c in clusters:
+        for d, v in c.properties.items():
+            properties[d] = normalize_properties(properties.get(d, v), v)
+
+    return Properties(properties)

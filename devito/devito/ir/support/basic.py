@@ -1,0 +1,1787 @@
+from collections.abc import Callable, Iterable
+from contextlib import suppress
+from functools import cached_property, wraps
+from itertools import chain, product
+
+import sympy
+from sympy import Expr, S
+
+from devito.ir.support.space import Backward, null_ispace
+from devito.ir.support.utils import AccessMode, erange, extrema
+from devito.ir.support.vector import LabeledVector, Vector
+from devito.symbolics import (
+    compare_ops, q_affine, q_comp_acc, q_constant, retrieve_indexed, search
+)
+from devito.tools import (
+    CacheInstances, Tag, as_mapper, as_tuple, cached_hash, filter_sorted, flatten,
+    is_integer, memoized_func, memoized_generator, memoized_meth, smart_gt, smart_lt
+)
+from devito.types import (
+    ComponentAccess, CriticalRegion, Dimension, DimensionTuple, Fence, Function, Symbol,
+    TBArray, Temp, TempArray
+)
+from devito.types.dimension import Thickness
+
+__all__ = ['ExprGeometry', 'IterationInstance', 'Scope', 'TimedAccess']
+
+
+class IndexMode(Tag):
+    """Tag for access functions."""
+    pass
+AFFINE = IndexMode('affine')  # noqa
+REGULAR = IndexMode('regular')
+IRREGULAR = IndexMode('irregular')
+
+# Symbols to create mock data dependencies
+mocksym0 = Symbol(name='__⋈_0__')
+mocksym1 = Symbol(name='__⋈_1__')
+
+
+class IterationInstance(LabeledVector):
+
+    """
+    A representation of the iteration and data points accessed by an
+    Indexed object. Three different concepts are distinguished:
+
+        * Index functions: the expressions describing what *iteration* space
+          points are accessed.
+        * ``aindices``: the Dimensions acting as iteration variables.
+          There is one aindex for each non-constant affine index function. If
+          the index function is non-affine, then it may not be possible to detect
+          its aindex; in such a case, None is used as placeholder.
+        * ``findices``: the Dimensions describing what *data* space point
+          are accessed.
+
+    An IterationInstance may be regular or irregular. It is regular if and only
+    if *all* index functions are affine in their respective findex.  The
+    downside of irregular IterationInstances is that dependence testing is
+    harder, which in turn may require the data dependence analyzer to act more
+    conservatively.
+
+    Examples
+    --------
+    Given:
+        x, y, z : findices
+        w : a generic Dimension
+
+         | x+1 |          |  x  |         |  x  |         | w |         | x+y |
+    obj1 | y+2 |,  obj2 = |  4  |, obj3 = |  x  |, obj4 = | y |, obj5 = |  y  |
+         | z-3 |          | z+1 |         |  y  |         | z |         |  z  |
+
+    We have that:
+
+        * obj1 and obj2 are regular;
+        * obj3 is irregular because an findex, ``x``, appears outside of its index
+          function (i.e., in the second slot, when ``y`` is expected);
+        * obj4 is irregular, because a different dimension, ``w``, is used in place
+          of ``x`` within the first index function, where ``x`` is expected;
+        * obj5 is irregular, as two findices appear in the same index function.
+    """
+
+    def __new__(cls, access):
+        try:
+            findices = tuple(access.function.dimensions)
+        except AttributeError:
+            # E.g., Objects, which don't have `dimensions`
+            findices = ()
+        if len(findices) != len(set(findices)):
+            raise ValueError("Illegal non-unique `findices`")
+        try:
+            indices = access.indices
+        except AttributeError:
+            # E.g., `access` is a FieldFromComposite rather than an Indexed
+            indices = (S.Infinity,)*len(findices)
+        return super().__new__(cls, list(zip(findices, indices, strict=False)))
+
+    def __hash__(self):
+        return super().__hash__()
+
+    @cached_property
+    def index_mode(self):
+        retval = []
+        for i, fi in zip(self, self.findices, strict=True):
+            dims = {j for j in i.free_symbols if isinstance(j, Dimension)}
+            if len(dims) == 0 and q_constant(i):
+                retval.append(AFFINE)
+                continue
+
+            # TODO: Exploit AffineIndexAccessFunction instead of calling
+            # q_affine -- ultimately it should get quicker!
+
+            sdims = {d for d in dims if d.is_Stencil}
+            # E.g. `x + i0 + i1` -> `candidates = {x}`
+            candidates = sdims if dims == sdims else dims - sdims
+
+            if len(candidates) == 1:
+                candidate = candidates.pop()
+                if fi._defines & candidate._defines:
+                    if q_affine(i, candidate):
+                        retval.append(AFFINE)
+                    else:
+                        retval.append(REGULAR)
+                else:
+                    retval.append(IRREGULAR)
+            else:
+                retval.append(IRREGULAR)
+        return DimensionTuple(*retval, getters=self.findices)
+
+    @cached_property
+    def aindices(self):
+        retval = []
+        for i, _ in zip(self, self.findices, strict=True):
+            dims = set(d.root if d.indirect else d for d in i.atoms(Dimension))
+            sdims = {d for d in dims if d.is_Stencil}
+            candidates = dims - sdims
+
+            if len(candidates) == 1:
+                retval.append(candidates.pop())
+            elif isinstance(i, Dimension):
+                retval.append(i)
+            else:
+                retval.append(None)
+        return DimensionTuple(*retval, getters=self.findices)
+
+    @property
+    def findices(self):
+        return self.labels
+
+    @cached_property
+    def index_map(self):
+        return dict(zip(self.aindices, self.findices, strict=True))
+
+    @cached_property
+    def defined_findices_affine(self):
+        ret = set()
+        for fi, im in zip(self.findices, self.index_mode, strict=True):
+            if im is AFFINE:
+                ret.update(fi._defines)
+        return ret
+
+    @cached_property
+    def defined_findices_irregular(self):
+        ret = set()
+        for fi, im in zip(self.findices, self.index_mode, strict=True):
+            if im is IRREGULAR:
+                ret.update(fi._defines)
+        return ret
+
+    def affine(self, findices):
+        """
+        Return True if all of the provided findices appear in self and are
+        affine, False otherwise.
+        """
+        return set(as_tuple(findices)).issubset(self.defined_findices_affine)
+
+    def affine_if_present(self, findices):
+        """
+        Return False if any of the provided findices appears in self and
+        is not affine, True otherwise.
+        """
+        present_findices = set(as_tuple(findices)) & set(self.findices)
+        return present_findices.issubset(self.defined_findices_affine)
+
+    def irregular(self, findices):
+        """
+        Return True if all of the provided findices appear in self and are
+        irregular, False otherwise.
+        """
+        return set(as_tuple(findices)).issubset(self.defined_findices_irregular)
+
+    @cached_property
+    def is_regular(self):
+        return all(i in (AFFINE, REGULAR) for i in self.index_mode)
+
+    @property
+    def is_irregular(self):
+        return not self.is_regular
+
+    @property
+    def is_scalar(self):
+        return self.rank == 0
+
+
+class TimedAccess(IterationInstance, AccessMode, CacheInstances):
+
+    """
+    A TimedAccess ties together an IterationInstance and an AccessMode.
+
+    Further:
+
+        * It may be associated with an IterationSpace.
+        * It carries a "timestamp", that is an integer indicating the statement
+          within which the TimedAccess appears in the execution flow.
+
+    Notes
+    -----
+    The comparison operators ``==, !=, <, <=, >, >=`` should be regarded as
+    operators for lexicographic ordering of TimedAccess objects, based
+    on the values of the index functions and the access mode (read, write).
+    """
+
+    @classmethod
+    def _preprocess_args(cls, access, mode, timestamp, ispace=null_ispace):
+        return (access, mode, timestamp, ispace), {}
+
+    def __new__(cls, access, mode, timestamp, ispace=None):
+        obj = super().__new__(cls, access)
+        AccessMode.__init__(obj, mode=mode)
+        return obj
+
+    def __init__(self, access, mode, timestamp, ispace=null_ispace):
+        assert is_integer(timestamp)
+
+        self.access = access
+        self.timestamp = timestamp
+        self.ispace = ispace
+
+    def __repr__(self):
+        mode = '\033[1;37;31mW\033[0m' if self.is_write else '\033[1;37;32mR\033[0m'
+        return f"{mode}<{self.name},[{', '.join(str(i) for i in self)}]>"
+
+    def __eq__(self, other):
+        if not isinstance(other, TimedAccess):
+            return False
+
+        # At this point no need to go through the class hierarchy's __eq__,
+        # which might require expensive comparisons of Vector entries (i.e.,
+        # SymPy expressions)
+
+        return (self.mode == other.mode and
+                self.timestamp == other.timestamp and
+                self.access == other.access and
+                self.ispace == other.ispace)
+
+    @cached_hash
+    def __hash__(self):
+        return hash((self.access, self.mode, self.timestamp, self.ispace))
+
+    @property
+    def function(self):
+        return self.access.function
+
+    @property
+    def name(self):
+        return self.function.name
+
+    @property
+    def intervals(self):
+        return self.ispace.intervals
+
+    @property
+    def directions(self):
+        return self.ispace.directions
+
+    @property
+    def itintervals(self):
+        return self.ispace.itintervals
+
+    @property
+    def is_local(self):
+        return self.function.is_Symbol
+
+    @cached_property
+    def is_regular(self):
+        if not super().is_regular:
+            return False
+
+        # The order of the `aindices` must match the order of the iteration
+        # space Dimensions
+        positions = []
+        for d in self.aindices:
+            try:
+                for n, i in enumerate(self.intervals):
+                    if i.dim._defines & d._defines:
+                        positions.append(n)
+                        break
+            except AttributeError:
+                # `d is None` due to e.g. constant access
+                continue
+        return positions == sorted(positions)
+
+    def __lt__(self, other):
+        if not isinstance(other, TimedAccess):
+            raise TypeError(f"Cannot compare with object of type {type(other)}")
+        if self.directions != other.directions:
+            raise TypeError("Cannot compare due to mismatching `direction`")
+        if self.intervals != other.intervals:
+            raise TypeError("Cannot compare due to mismatching `intervals`")
+        return super().__lt__(other)
+
+    def lex_eq(self, other):
+        return self.timestamp == other.timestamp
+
+    def lex_ne(self, other):
+        return self.timestamp != other.timestamp
+
+    def lex_ge(self, other):
+        return self.timestamp >= other.timestamp
+
+    def lex_gt(self, other):
+        return self.timestamp > other.timestamp
+
+    def lex_le(self, other):
+        return self.timestamp <= other.timestamp
+
+    def lex_lt(self, other):
+        return self.timestamp < other.timestamp
+
+    def rebuild(self, **kwargs):
+        access = kwargs.get('access', self.access)
+        mode = kwargs.get('mode', self.mode)
+        timestamp = kwargs.get('timestamp', self.timestamp)
+        ispace = kwargs.get('ispace', self.ispace)
+
+        if access is self.access and \
+           mode is self.mode and \
+           timestamp is self.timestamp and \
+           ispace is self.ispace:
+            return self
+
+        return TimedAccess(access, mode, timestamp, ispace)
+
+    @memoized_meth
+    def distance(self, other, logical=False):
+        """
+        Compute the distance from ``self`` to ``other``.
+
+        Parameters
+        ----------
+        other : TimedAccess
+            The TimedAccess w.r.t. which the distance is computed.
+        logical : bool
+            Compute a logical distance rather than true distance (i.e. ignoring
+            degenerating indices created by size 1 buffers etc).
+        """
+        if isinstance(self.access, ComponentAccess) and \
+           isinstance(other.access, ComponentAccess) and \
+           self.access.index != other.access.index:
+            # E.g., `uv(x).x` and `uv(x).y` -- not a real dependence!
+            return Vector(S.ImaginaryUnit)
+
+        if disjoint_subdims(self, other):
+            return Vector(S.ImaginaryUnit)
+
+        ret = []
+        for sit, oit in zip(self.itintervals, other.itintervals, strict=False):
+            n = len(ret)
+
+            try:
+                sai = self.aindices[n]
+                oai = other.aindices[n]
+            except IndexError:
+                # E.g., `self=R<f,[x]>` and `self.itintervals=(x, i)`
+                break
+
+            try:
+                if not (sit == oit and sai.root is oai.root):
+                    # E.g., `self=R<f,[x + 2]>` and `other=W<f,[i + 1]>`
+                    # E.g., `self=R<f,[x]>`, `other=W<f,[x + 1]>`,
+                    #       `self.itintervals=(x<0>,)`, `other.itintervals=(x<1>,)`
+                    # Keep looking: a later axis may prove disjointness
+                    ret.append(S.Infinity)
+                    continue
+            except AttributeError:
+                # E.g., `self=R<f,[cy]>` and `self.itintervals=(y,)` => `sai=None`
+                pass
+
+            if skippable_interval(sai, self.ispace, sit) and \
+               skippable_interval(oai, other.ispace, oit):
+                continue
+
+            # In some cases, the distance degenerates because `self` and
+            # `other` never intersect, which essentially means there's no
+            # dependence between them. In this case, we set the distance to a
+            # dummy value (the imaginary unit). Hence, we call these "imaginary
+            # dependences". This occurs in just a small set of special cases,
+            # which we attempt to handle here
+            if any(d and d._defines & sit.dim._defines for d in (sai, oai)):
+                # Case 1: `sit` is an IterationInterval with statically known
+                # trip count. E.g. it ranges from 0 to 3; `other` performs a
+                # constant access at 4
+                for v in (self[n], other[n]):
+                    # Note: Uses smart_ comparisons avoid evaluating expensive
+                    # symbolic Lt or Gt operations,
+                    # Note: Boolean is split to make the conditional short
+                    # circuit more frequently for mild speedup.
+                    if smart_lt(v, sit.symbolic_min) or \
+                       smart_gt(v, sit.symbolic_max):
+                        return Vector(S.ImaginaryUnit)
+
+                # Case 2: `sit` is an IterationInterval over a local SubDimension
+                # and `other` performs a constant access
+                for d0, d1 in ((sai, oai), (oai, sai)):
+                    if d0 is None and d1.is_Sub and d1.local:
+                        return Vector(S.ImaginaryUnit)
+
+                # Case 3: `self` and `other` have some special form such that
+                # it's provable that they never intersect
+                if sit == oit:
+                    dims = {sai, oai} - {None}
+                    if any(disjoint_test(self[n], other[n], d, sit) for d in dims):
+                        return Vector(S.ImaginaryUnit)
+
+            # Compute the distance along the current IterationInterval
+            if self.function._mem_shared:
+                # Special case: the distance between two regular, thread-shared
+                # objects falls back to zero, as any other value would be
+                # nonsensical
+                ret.append(S.Zero)
+            elif degenerating_indices(self[n], other[n], self.function, logical=logical):
+                # Special case: `sai` and `oai` may be different symbolic objects
+                # but they can be proved to systematically generate the same value
+                ret.append(S.Zero)
+            elif sai and oai and sai._defines & sit.dim._defines:
+                # E.g., `self=R<f,[t + 1, x]>`, `self.itintervals=(time, x)`,
+                # and `ai=t`
+                if sit.direction is Backward:
+                    ret.append(other[n] - self[n])
+                else:
+                    ret.append(self[n] - other[n])
+            elif not sai and not oai:
+                if self[n] - other[n] == 0:
+                    # E.g., `self=R<a,[4]>` and `other=W<a,[4]>`
+                    ret.append(S.Zero)
+                else:
+                    # E.g., `self=R<a,[3]>` and `other=W<a,[4]>`
+                    break
+            elif any(i is S.Infinity for i in (self[n], other[n])):
+                # E.g., `self=R<f,[oo, oo]>` (due to `self.access=f_vec->size[1]`)
+                # and `other=W<f,[t - 1, x + 1]>`
+                ret.append(S.Zero)
+            else:
+                # E.g., `self=R<u,[t+1, ii_src_0+1]>`, `fi=p_src`, `n=1`
+                # E.g., `self=R<a,[time,x]>`, `other=W<a,[time,4]>`, `n=1`
+                return vinf(ret)
+
+        n = len(ret)
+
+        # It might be `a[t, ⊥] -> a[t, x+1]`, that is the source is a special
+        # Indexed representing an arbitrary access along `x`, within the `t`
+        # IterationSpace, while the sink lives within the `tx` IterationSpace
+        if len(self.itintervals[n:]) != len(other.itintervals[n:]):
+            v = Vector(*ret)
+            if v != 0:
+                return v
+            else:
+                ret.append(S.Infinity)
+                return Vector(*ret)
+
+        # It still could be an imaginary dependence, e.g. `a[3] -> a[4]` or, more
+        # nasty, `a[i+1, 3] -> a[i, 4]`
+        for i, j in zip(self[n:], other[n:], strict=False):
+            if i == j:
+                ret.append(S.Zero)
+            else:
+                v = i - j
+                if v.is_Number and v.is_finite:
+                    if i.is_Number and j.is_Number:
+                        return Vector(S.ImaginaryUnit)
+                    else:
+                        # For example:
+                        # self=W<u,[0,y]> and other=R<u,[0,y+1]>
+                        ret.append(v)
+
+                # Writing (reading) over an entire dimension, reading (writing)
+                # from one point. For example:
+                # self=R<u,[1,2]> and other=W<u,[1, y+1]>
+                elif (not i.is_Number or not j.is_Number):
+                    ret.append(S.Infinity)
+
+        return Vector(*ret)
+
+    def touched_nodomain(self, findex):
+        """
+        Return a boolean 2-tuple, one entry for each ``findex`` DataSide. True
+        means that the entire access lies outside the DOMAIN along that
+        DataSide.
+
+        If containment outside the DOMAIN cannot be proven, return False for
+        that DataSide. Unlike ``touched_halo``, this is a containment query and
+        applies irrespective of whether ``findex`` is distributed.
+        """
+        if not self.affine(findex):
+            return (False, False)
+
+        d = self.aindices[findex]
+        limits = []
+        if d is not None:
+            i = self.intervals[d]
+            if i.is_Null:
+                return (False, False)
+            limits.append((d, d.symbolic_min + i.lower, d.symbolic_max + i.upper))
+
+        # Runtime DOMAIN bounds may select any part of the allocated extent
+        for v in (findex.symbolic_min, findex.symbolic_max):
+            if v.is_Symbol:
+                limits.append((v, S.Zero, findex.symbolic_size - 1))
+
+        def outside(expr):
+            # A negative maximum distance proves the entire access is outside
+            expr = sympy.expand(expr)
+            for symbol, lower, upper in limits:
+                coefficient = expr.diff(symbol)
+                if coefficient.has(symbol):
+                    return False
+                elif coefficient.is_nonnegative:
+                    expr = expr.subs(symbol, upper)
+                elif coefficient.is_nonpositive:
+                    expr = expr.subs(symbol, lower)
+                else:
+                    return False
+
+            return expr.is_negative is True
+
+        index = self[findex] - self.function._size_nodomain[findex].left
+        return (outside(index - findex.symbolic_min),
+                outside(findex.symbolic_max - index))
+
+    def touched_halo(self, findex):
+        """
+        Return a boolean 2-tuple, one entry for each ``findex`` DataSide. True
+        means that the halo is touched along that DataSide.
+        """
+        # If an irregularly (non-affine) accessed Dimension, conservatively
+        # assume the halo will be touched
+        if self.irregular(findex):
+            return (True, True)
+
+        d = self.aindices[findex]
+
+        # If the iterator is *not* a distributed Dimension, then surely the halo
+        # isn't touched
+        try:
+            if not d._maybe_distributed:
+                return (False, False)
+        except AttributeError:
+            pass
+
+        # If a constant (integer, symbolic expr) is used to index into `findex`,
+        # there is actually nothing we can do -- the most likely scenario is that
+        # it's accessing into a *local* SubDomain/SubDimension
+        # TODO: make sure this is indeed the case
+        if is_integer(self[findex]) or d not in self[findex].free_symbols:
+            return (False, False)
+
+        # Given `d`'s iteration Interval `d[m, M]`, we know that `d` iterates between
+        # `d_m + m` and `d_M + M`
+        m, M = self.intervals[d].offsets
+
+        # If `m + (self[d] - d) < self.function._size_nodomain[d].left`, then `self`
+        # will definitely touch the left-halo, at least when `d=0`
+        size_nodomain_left = self.function._size_nodomain[findex].left
+
+        # Symbolic thicknesses may appear in indices for Functions defined on SubDomains
+        # These are used to offset the loop index values to correctly index into the
+        # reduced array allocated on the SubDomain. As such, they do not represent a
+        # shift of index on the physical grid and can (and should) be zeroed for the
+        # purpose of determining if the halo is touched.
+        tkns_subs = {tkn: 0 for tkn in search(self[findex], Thickness)}
+        findex_wo_thickness = self[findex].subs(tkns_subs)
+
+        try:
+            touch_halo_left = bool(m + (findex_wo_thickness - d) < size_nodomain_left)
+        except TypeError:
+            # Two reasons we might end up here:
+            # * `d` is a constant integer
+            # * `m` is a symbol (e.g., a SubDimension-induced offset)
+            #   TODO: we could exploit the properties attached to `m` (if any), such
+            #         as `nonnegative` etc, to do something smarter than just
+            #         assuming, conservatively, `touch_halo_left = True`
+            touch_halo_left = True
+
+        # If `M + (self[d] - d) > self.function._size_nodomain[d].left`, then
+        # `self` will definitely touch the right-halo, at least when `d=d_M`
+        try:
+            touch_halo_right = bool(M + (findex_wo_thickness - d) > size_nodomain_left)
+        except TypeError:
+            # See comments in the except block above
+            touch_halo_right = True
+
+        return (touch_halo_left, touch_halo_right)
+
+
+class Relation:
+
+    """
+    A relation between two TimedAccess objects.
+    """
+
+    def __init__(self, source, sink):
+        assert isinstance(source, TimedAccess) and isinstance(sink, TimedAccess)
+        assert source.function == sink.function
+        self.source = source
+        self.sink = sink
+
+    def __repr__(self):
+        return f"{self.source} -- {self.sink}"
+
+    def __eq__(self, other):
+        # If the timestamps are equal in `self` (ie, an inplace dependence) then
+        # they must be equal in `other` too
+        return (self.source == other.source and
+                self.sink == other.sink and
+                ((self.source.timestamp == self.sink.timestamp) ==
+                 (other.source.timestamp == other.sink.timestamp)))
+
+    def __hash__(self):
+        return hash(
+            (self.source, self.sink, self.source.timestamp == self.sink.timestamp)
+        )
+
+    @cached_property
+    def function(self):
+        if q_comp_acc(self.source.access) and not q_comp_acc(self.sink.access):
+            # E.g., `source=ab[x].x` and `sink=ab[x]` -> `a(x)`
+            return self.source.access.function_access
+        elif not q_comp_acc(self.source.access) and q_comp_acc(self.sink.access):
+            # E.g., `source=ab[x]` and `sink=ab[x].y` -> `b(x)`
+            return self.sink.access.function_access
+        else:
+            return self.source.function
+
+    @property
+    def findices(self):
+        return self.source.findices
+
+    @property
+    def timestamp(self):
+        return max(self.source.timestamp, self.sink.timestamp)
+
+    @cached_property
+    def distance(self):
+        return self.source.distance(self.sink)
+
+    @cached_property
+    def _defined_findices(self):
+        return frozenset(flatten(i._defines for i in self.findices))
+
+    @cached_property
+    def distance_mapper(self):
+        retval = {}
+        for i, j in zip(self.findices, self.distance, strict=False):
+            for d in i._defines:
+                retval[d] = j
+        return retval
+
+    @cached_property
+    def is_regular(self):
+        # NOTE: what we do below is stronger than something along the lines of
+        # `self.source.is_regular and self.sink.is_regular`
+        # `source` and `sink` may be regular in isolation, but the relation
+        # itself could be irregular, as the two TimedAccesses may stem from
+        # different iteration spaces. Instead if the distance is an integer
+        # vector, it is guaranteed that the iteration space is the same
+        return all(is_integer(i) for i in self.distance)
+
+    @cached_property
+    def is_irregular(self):
+        return not self.is_regular
+
+    @cached_property
+    def is_lex_positive(self):
+        """
+        True if the source precedes the sink, False otherwise.
+        """
+        return self.source.timestamp < self.sink.timestamp
+
+    @cached_property
+    def is_lex_equal(self):
+        """
+        True if the source has same timestamp as the sink, False otherwise.
+        """
+        return self.source.timestamp == self.sink.timestamp
+
+    @cached_property
+    def is_lex_ne(self):
+        """True if the source's and sink's timestamps differ, False otherwise."""
+        return self.source.timestamp != self.sink.timestamp
+
+    @cached_property
+    def is_lex_negative(self):
+        """
+        True if the sink precedes the source, False otherwise.
+        """
+        return self.source.timestamp > self.sink.timestamp
+
+    @cached_property
+    def is_lex_non_stmt(self):
+        """
+        True if either the source or the sink are from non-statements,
+        False otherwise.
+        """
+        return self.source.timestamp == -1 or self.sink.timestamp == -1
+
+    @property
+    def is_local(self):
+        return self.function.is_Symbol
+
+    @property
+    def is_imaginary(self):
+        return S.ImaginaryUnit in self.distance
+
+
+class Dependence(Relation, CacheInstances):
+
+    """
+    A data dependence between two TimedAccess objects.
+    """
+
+    def __repr__(self):
+        return f"{self.source} -> {self.sink}"
+
+    @cached_property
+    def cause(self):
+        """Return the findex causing the dependence."""
+        for i, j in zip(self.findices, self.distance, strict=False):
+            try:
+                if j > 0:
+                    return i._defines
+            except TypeError:
+                # Conservatively assume this is an offending dimension
+                return i._defines
+        return frozenset()
+
+    @cached_property
+    def read(self):
+        if self.is_flow:
+            return self.sink
+        elif self.is_anti:
+            return self.source
+        else:
+            return None
+
+    @cached_property
+    def write(self):
+        if self.is_flow:
+            return self.source
+        elif self.is_anti:
+            return self.sink
+        else:
+            return None
+
+    @cached_property
+    def is_flow(self):
+        return self.source.is_write and self.sink.is_read
+
+    @cached_property
+    def is_anti(self):
+        return self.source.is_read and self.sink.is_write
+
+    @cached_property
+    def is_waw(self):
+        return self.source.is_write and self.sink.is_write
+
+    @cached_property
+    def is_iaw(self):
+        """Is it an reduction-after-write dependence ?"""
+        return self.source.is_write and self.sink.is_reduction
+
+    @cached_property
+    def is_reduction(self):
+        return self.source.is_reduction or self.sink.is_reduction
+
+    @cached_property
+    def as_logical(self):
+        return LogicalDependence(self.source, self.sink)
+
+    @memoized_meth
+    def is_const(self, dim):
+        """
+        True if a constant dependence, that is no Dimensions involved, False otherwise.
+        """
+        return (self.source.aindices.get(dim) is None and
+                self.sink.aindices.get(dim) is None and
+                self.distance_mapper.get(dim, 0) == 0)
+
+    @memoized_meth
+    def is_carried(self, dim=None):
+        """Return True if definitely a dimension-carried dependence, False otherwise."""
+        try:
+            if dim is None:
+                return self.distance > 0
+            else:
+                return len(self.cause & dim._defines) > 0
+        except TypeError:
+            # Conservatively assume this is a carried dependence
+            return True
+
+    @memoized_meth
+    def is_reduce(self, dim):
+        """
+        Return True if ``dim`` may represent a reduction dimension for
+        ``self``, False otherwise.
+        """
+        return (self.is_reduction and
+                self.is_regular and
+                not (dim._defines & self._defined_findices))
+
+    @memoized_meth
+    def is_reduce_atmost(self, dim=None):
+        """
+        More relaxed than :meth:`is_reduce`. Return True  if ``dim`` may
+        represent a reduction dimension for ``self`` or if `self`` is definitely
+        independent of ``dim``, False otherwise.
+        """
+        return (not (dim._defines & self._defined_findices)
+                or self.is_indep(dim))
+
+    @memoized_meth
+    def is_indep(self, dim=None):
+        """
+        Return True if definitely a dimension-independent dependence, False otherwise.
+        """
+        try:
+            if self.source.is_irregular or self.sink.is_irregular:
+                # Note: we cannot just return `self.distance == 0` as an irregular
+                # source/sink might mean that an array is actually accessed indirectly
+                # (e.g., A[B[i]]), thus there would be no guarantee on independence
+                # The only hope at this point is that the irregularity is not along
+                # `dim` *and* that the distance along `dim` is 0 (e.g., dim=x and
+                # f[x, g[x, y]] -> f[x, h[x, y]])
+                try:
+                    return (self.source.affine(dim) and
+                            self.sink.affine(dim) and
+                            self.distance_mapper[dim] == 0)
+                except KeyError:
+                    # `dim is None` or anything not in `self._defined_findices`
+                    return False
+            if dim is None:
+                return self.distance == 0
+            else:
+                # The only hope at this point is that `dim` appears in the findices
+                # with distance 0 (that is, it's not the cause of the dependence)
+                return (any(i in self._defined_findices for i in dim._defines) and
+                        len(self.cause & dim._defines) == 0)
+        except TypeError:
+            # Conservatively assume this is not dimension-independent
+            return False
+
+    @memoized_meth
+    def is_inplace(self, dim=None):
+        """Stronger than ``is_indep()``, as it also compares the timestamps."""
+        return self.source.lex_eq(self.sink) and self.is_indep(dim)
+
+    @memoized_meth
+    def is_storage_related(self, dims=None):
+        """
+        True if a storage-related dependence, that is multiple iterations
+        cause the access of the same memory location, False otherwise.
+        """
+        for d in self.findices:
+            if d._defines & set(as_tuple(dims)):  # noqa: SIM102
+                if any(i.is_NonlinearDerived for i in d._defines) or \
+                   self.is_const(d):
+                    return True
+        return False
+
+
+class LogicalDependence(Dependence):
+
+    @cached_property
+    def distance(self):
+        return self.source.distance(self.sink, logical=True)
+
+
+class DependenceGroup(set):
+
+    @cached_property
+    def cause(self):
+        return frozenset().union(*[i.cause for i in self])
+
+    @cached_property
+    def functions(self):
+        """Return the DiscreteFunctions inducing a dependence."""
+        return frozenset({i.function for i in self})
+
+    @cached_property
+    def none(self):
+        return len(self) == 0
+
+    @cached_property
+    def reduction(self):
+        """Return the reduction-induced dependences."""
+        return DependenceGroup(i for i in self if i.is_reduction)
+
+    def carried(self, dim=None):
+        """Return the dimension-carried dependences."""
+        return DependenceGroup(i for i in self if i.is_carried(dim))
+
+    def independent(self, dim=None):
+        """Return the dimension-independent dependences."""
+        return DependenceGroup(i for i in self if i.is_indep(dim))
+
+    def inplace(self, dim=None):
+        """Return the in-place dependences."""
+        return DependenceGroup(i for i in self if i.is_inplace(dim))
+
+    def __add__(self, other):
+        assert isinstance(other, DependenceGroup)
+        return DependenceGroup(super().__or__(other))
+
+    def __sub__(self, other):
+        assert isinstance(other, DependenceGroup)
+        return DependenceGroup(super().__sub__(other))
+
+    def project(self, function):
+        """
+        Return a new DependenceGroup retaining only the dependences due to
+        the provided function.
+        """
+        return DependenceGroup(i for i in self if i.function is function)
+
+
+class Scope(CacheInstances):
+
+    # Describes a rule for dependencies
+    Rule = Callable[[TimedAccess, TimedAccess], bool]
+
+    def normalize_input(func):
+
+        @wraps(func)
+        def wrapper(self, *args, writes=None, **kwargs):
+            mapped = {}
+            for k in as_tuple(writes or self.writes):
+                v = self.getwrites(k)
+                if v:
+                    mapped[k] = v
+            return func(self, *args, writes=mapped, **kwargs)
+
+        return wrapper
+
+    @classmethod
+    @memoized_func(scope='build')
+    def from_scopes(cls, scope0, scope1):
+        """
+        Build a synthetic Scope out of two existing Scopes by reusing their
+        cached reads and writes rather than rediscovering accesses from the
+        underlying expressions.
+
+        This is used to analyze cross-scope dependences cheaply, for example in
+        loop-fusion hazard checks. Return None if the two Scopes cannot induce
+        any cross-scope dependences.
+        """
+        offset = len(scope0.exprs)
+
+        targets = (
+            set(scope0.writes) & scope1.functions
+        ) | (
+            set(scope1.writes) & scope0.functions
+        )
+        if not targets:
+            return None
+
+        def is_cross(source, sink):
+            t0 = source.timestamp
+            t1 = sink.timestamp
+            return t0 < offset <= t1 or t1 < offset <= t0
+
+        reads = {}
+        writes = {}
+
+        for f in targets:
+            shifted = tuple(
+                i.rebuild(timestamp=i.timestamp + offset)
+                for i in scope1.getreads(f)
+            )
+            accesses = scope0.getreads(f)
+            if shifted:
+                accesses = accesses + shifted if accesses else shifted
+            if accesses:
+                reads[f] = accesses
+
+            shifted = tuple(
+                i.rebuild(timestamp=i.timestamp + offset)
+                for i in scope1.getwrites(f)
+            )
+            accesses = scope0.getwrites(f)
+            if shifted:
+                accesses = accesses + shifted if accesses else shifted
+            if accesses:
+                writes[f] = accesses
+
+        return cls((), rules=is_cross, reads=reads.items(), writes=writes.items())
+
+    @classmethod
+    def _preprocess_args(cls, exprs: Expr | Iterable[Expr],
+                         **kwargs) -> tuple[tuple, dict]:
+        for i in ('reads', 'writes'):
+            with suppress(KeyError):
+                kwargs[i] = tuple(kwargs[i])
+
+        return (as_tuple(exprs),), kwargs
+
+    def __init__(self, exprs: tuple[Expr],
+                 rules: Rule | tuple[Rule] | None = None,
+                 reads=None, writes=None) -> None:
+        """
+        A Scope enables data dependence analysis on a totally ordered sequence
+        of expressions.
+        """
+        self.exprs = exprs
+        self._reads = dict(reads) if reads is not None else None
+        self._writes = dict(writes) if writes is not None else None
+
+        # A set of rules to drive the collection of dependencies
+        self.rules: tuple[Scope.Rule] = as_tuple(rules)  # type: ignore[assignment]
+        assert all(callable(i) for i in self.rules)
+
+    @memoized_generator
+    def writes_gen(self):
+        """
+        Generate all write accesses.
+        """
+        for i, e in enumerate(self.exprs):
+            for j in e.writes:
+                mode = 'WR' if e.is_Reduction else 'W'
+                yield TimedAccess(j, mode, i, e.ispace)
+
+        # Objects altering the control flow (e.g., synchronization barriers,
+        # break statements, ...) are converted into mock dependences
+
+        # Fences (any sort) cannot float around upon topological sorting
+        for i, e in enumerate(self.exprs):
+            if isinstance(e.rhs, Fence):
+                yield TimedAccess(mocksym0, 'W', i, e.ispace)
+
+        # CriticalRegions are stronger than plain Fences.
+        # We must also ensure that none of the Eqs within an opening-closing
+        # CriticalRegion pair floats outside upon topological sorting
+        for i, e in enumerate(self.exprs):
+            if isinstance(e.rhs, CriticalRegion) and e.rhs.opening:
+                for j, e1 in enumerate(self.exprs[i+1:], 1):
+                    if isinstance(e1.rhs, CriticalRegion) and e1.rhs.closing:
+                        break
+                    yield TimedAccess(mocksym1, 'W', i+j, e1.ispace)
+
+    @cached_property
+    def writes(self):
+        """
+        Create a mapper from functions to write accesses.
+        """
+        if self._writes is not None:
+            return self._writes
+
+        return as_mapper(self.writes_gen(), key=lambda i: i.function)
+
+    @cached_property
+    def writes_tensor(self):
+        initialized = frozenset(e.lhs.function for e in self.exprs
+                                if not e.is_Reduction and e.is_scalar)
+        return frozenset(self.writes) - initialized
+
+    @memoized_generator
+    def reads_explicit_gen(self):
+        """
+        Generate all explicit reads. These are the read accesses to the
+        AbstractFunctions and Symbols appearing in the Scope's symbolic
+        expressions.
+        """
+        for i, e in enumerate(self.exprs):
+            for j in e.reads_explicit:
+                mode = 'RR' if j.function is e.lhs.function and e.is_Reduction else 'R'
+                yield TimedAccess(j, mode, i, e.ispace)
+
+            # If a reduction, we got one implicit read
+            if e.is_Reduction:
+                yield TimedAccess(e.lhs, 'RR', i, e.ispace)
+
+            # Look up ConditionalDimensions
+            for j in e.reads_conditional:
+                yield TimedAccess(j, 'R', -1, e.ispace)
+
+    @memoized_generator
+    def reads_implicit_gen(self):
+        """
+        Generate all implicit reads. These are for examples the reads accesses
+        to the iteration symbols bounded to the Dimensions used in the Scope's
+        symbolic expressions.
+        """
+        # The iteration symbols
+        dimensions = set().union(*[e.dimensions for e in self.exprs])
+        symbols = set()
+        for d in dimensions:
+            symbols.update(d.free_symbols | d.bound_symbols)
+        for i in symbols:
+            yield TimedAccess(i, 'R', -1)
+
+    @memoized_generator
+    def reads_synchro_gen(self):
+        """
+        Generate all reads due to synchronization operations. These may be explicit
+        or implicit.
+        """
+        # Objects altering the control flow (e.g., synchronization barriers,
+        # break statements, ...) are converted into mock dependences
+
+        # Fences (any sort) cannot float around upon topological sorting
+        for i, e in enumerate(self.exprs):
+            if isinstance(e.rhs, Fence):
+                if i > 0:
+                    yield TimedAccess(mocksym0, 'R', i-1, e.ispace)
+                if i < len(self.exprs)-1:
+                    yield TimedAccess(mocksym0, 'R', i+1, e.ispace)
+
+        # CriticalRegions are stronger than plain Fences.
+        # We must also ensure that none of the Eqs within an opening-closing
+        # CriticalRegion pair floats outside upon topological sorting
+        for i, e in enumerate(self.exprs):
+            if isinstance(e.rhs, CriticalRegion):
+                if e.rhs.opening and i > 0:
+                    yield TimedAccess(mocksym1, 'R', i-1, self.exprs[i-1].ispace)
+                elif e.rhs.closing and i < len(self.exprs)-1:
+                    yield TimedAccess(mocksym1, 'R', i+1, self.exprs[i+1].ispace)
+
+    @memoized_generator
+    def reads_gen(self):
+        """
+        Generate all read accesses.
+        """
+        # NOTE: The reason to keep the explicit and implicit reads separated
+        # is efficiency. Sometimes we wish to extract all reads to a given
+        # AbstractFunction, and we know that by construction these can't
+        # appear among the implicit reads
+        return chain(self.reads_explicit_gen(),
+                     self.reads_synchro_gen(),
+                     self.reads_implicit_gen())
+
+    @memoized_generator
+    def reads_smart_gen(self, f):
+        """
+        Generate all read accesses to a given function.
+
+        StencilDimensions, if any, are replaced with:
+
+            * in presence of SubDimensions: the range of points they span;
+            * in all other cases: just their extrema, since it suffices to
+              capture all possible dependencies.
+
+        The reason SubDimensions must be treated specially -- with a full set
+        of TimedAccess objects getting generated -- is to handle the special
+        case of SubDimensions thinner than the stencil’s reach. For example, consider
+        the following scenario:
+
+        * A SubDimension with just two points, 10 and 11;
+        * One equation writes `F[10]` and `F[11]`;
+        * Another equation runs over the same SubDimension reading the stencil
+          `F[x-4] ... F[x+4]`.
+
+        If we examine only the two extreme stencil offsets:
+
+        * `F[x-4]` reads points 6–7: no overlap.
+        * `F[x+4]` reads points 14–15: no overlap.
+
+        But interior offsets certainly overlap -- for instance, `F[x-1]` reads
+        9–10, which includes the producer’s point 10.
+
+        Notes
+        -----
+        The implementation is smart, in the sense that, depending on the
+        given function type, it will not necessarily look everywhere inside
+        the scope to retrieve the corresponding read accesses. Instead, it
+        will only look in the places where the given type is expected to
+        be found. For example, a DiscreteFunction would never appear among
+        the iteration symbols.
+        """
+        uses_subdims = lambda i: any(d.is_Sub for d in i.ispace.dimensions)
+
+        if isinstance(f, (Function, Temp, TempArray, TBArray)):
+            for i in self.getreads(f):
+                expand = erange if uses_subdims(i) else extrema
+
+                for j in expand(i.access):
+                    yield TimedAccess(j, i.mode, i.timestamp, i.ispace)
+
+        else:
+            for i in self.getreads(f):
+                yield i
+
+    @cached_property
+    def reads(self):
+        """
+        Create a mapper from functions to read accesses.
+        """
+        if self._reads is not None:
+            return self._reads
+
+        return as_mapper(self.reads_gen(), key=lambda i: i.function)
+
+    @cached_property
+    def read_only(self):
+        """
+        Create a mapper from functions to read accesses.
+        """
+        return set(self.reads) - set(self.writes)
+
+    @cached_property
+    def has_barrier(self):
+        """True if the Scope contains a fence-like control-flow object."""
+        return any(isinstance(e.rhs, (Fence, CriticalRegion)) for e in self.exprs)
+
+    def getreads(self, function):
+        return as_tuple(self.reads.get(function))
+
+    def getwrites(self, function):
+        return as_tuple(self.writes.get(function))
+
+    def __getitem__(self, function):
+        return self.getwrites(function) + self.getreads(function)
+
+    def __repr__(self):
+        tracked = filter_sorted(set(self.reads) | set(self.writes),
+                                key=lambda i: i.name)
+        maxlen = max(1, max([len(i.name) for i in tracked]))
+        out = f"{{:>{maxlen}}} =>  W : {{}}\n{{:>{maxlen}}}     R : {{}}"
+        pad = " "*(maxlen + 9)
+        reads = [self.getreads(i) for i in tracked]
+        for i, r in enumerate(list(reads)):
+            if not r:
+                reads[i] = ''
+                continue
+            first = f"{tuple.__repr__(r[0])}"
+            shifted = "\n".join(f"{pad}{tuple.__repr__(j)}" for j in r[1:])
+            newline_prefix = '\n' if shifted else ''
+            shifted = f"{newline_prefix}{shifted}"
+            reads[i] = first + shifted
+        writes = [self.getwrites(i) for i in tracked]
+        for i, w in enumerate(list(writes)):
+            if not w:
+                writes[i] = ''
+                continue
+            first = f"{tuple.__repr__(w[0])}"
+            shifted = "\n".join(f"{pad}{tuple.__repr__(j)}" for j in w[1:])
+            shifted = f"{chr(10) if shifted else ''}{shifted}"
+            writes[i] = f'\033[1;37;31m{first + shifted}\033[0m'
+        return "\n".join([out.format(i.name, w, '', r)
+                          for i, r, w in zip(tracked, reads, writes, strict=True)])
+
+    @cached_property
+    def accesses(self):
+        groups = list(self.reads.values()) + list(self.writes.values())
+        return [i for group in groups for i in group]
+
+    @cached_property
+    def indexeds(self):
+        return tuple(i.access for i in self.accesses if i.access.is_Indexed)
+
+    @cached_property
+    def functions(self):
+        return set(self.reads) | set(self.writes)
+
+    @memoized_meth
+    def a_query(self, timestamps=None, modes=None):
+        timestamps = as_tuple(timestamps)
+        modes = as_tuple(modes) or TimedAccess._modes
+        return tuple(a for a in self.accesses
+                     if a.timestamp in timestamps and a.mode in modes)
+
+    @memoized_generator
+    @normalize_input
+    def d_flow_gen(self, writes=None):
+        """
+        Generate the flow (or "read-after-write") dependences.
+
+        If ``writes`` is provided, restrict the analysis to those Functions.
+        """
+        for k, v in writes.items():
+            reads = tuple(self.reads_smart_gen(k))
+            for w in v:
+                for r in reads:
+                    if any(not rule(w, r) for rule in self.rules):
+                        continue
+
+                    dependence = Dependence(w, r)
+
+                    if dependence.is_imaginary:
+                        continue
+
+                    distance = dependence.distance
+
+                    try:
+                        is_flow = distance > 0 or (r.lex_ge(w) and distance == 0)
+                    except TypeError:
+                        # Non-integer vectors are not comparable.
+                        # Conservatively, we assume it is a dependence, unless
+                        # it's a read-for-reduction
+                        is_flow = not r.is_read_reduction
+                    if is_flow:
+                        yield dependence
+
+    @cached_property
+    def d_flow(self):
+        """Flow (or "read-after-write") dependences."""
+        return DependenceGroup(self.d_flow_gen())
+
+    @memoized_generator
+    @normalize_input
+    def d_anti_gen(self, depcls=Dependence, writes=None):
+        """
+        Generate the anti (or "write-after-read") dependences.
+
+        If ``writes`` is provided, restrict the analysis to those Functions.
+        """
+        for k, v in writes.items():
+            reads = tuple(self.reads_smart_gen(k))
+            for w in v:
+                for r in reads:
+                    if any(not rule(r, w) for rule in self.rules):
+                        continue
+
+                    dependence = depcls(r, w)
+
+                    if dependence.is_imaginary:
+                        continue
+
+                    distance = dependence.distance
+
+                    try:
+                        is_anti = distance > 0 or (r.lex_lt(w) and distance == 0)
+                    except TypeError:
+                        # Non-integer vectors are not comparable.
+                        # Conservatively, we assume it is a dependence, unless
+                        # it's a read-for-reduction
+                        is_anti = not r.is_read_reduction
+                    if is_anti:
+                        yield dependence
+
+    @cached_property
+    def d_anti(self):
+        """Anti (or "write-after-read") dependences."""
+        return DependenceGroup(self.d_anti_gen())
+
+    @cached_property
+    def d_anti_logical(self):
+        """
+        Anti (or "write-after-read") dependences using logical rather than true
+        distances.
+        """
+        return DependenceGroup(self.d_anti_gen(depcls=LogicalDependence))
+
+    @memoized_generator
+    @normalize_input
+    def d_output_gen(self, writes=None):
+        """
+        Generate the output (or "write-after-write") dependences.
+
+        If ``writes`` is provided, restrict the analysis to those Functions.
+        """
+        for v in writes.values():
+            for w1 in v:
+                for w2 in v:
+                    if any(not rule(w2, w1) for rule in self.rules):
+                        continue
+
+                    dependence = Dependence(w2, w1)
+
+                    if dependence.is_imaginary:
+                        continue
+
+                    distance = dependence.distance
+                    try:
+                        is_output = distance > 0 or (w2.lex_gt(w1) and distance == 0)
+                    except TypeError:
+                        # Non-integer vectors are not comparable.
+                        # Conservatively, we assume it is a dependence
+                        is_output = True
+                    if is_output:
+                        yield dependence
+
+    @cached_property
+    def d_output(self):
+        """Output (or "write-after-write") dependences."""
+        return DependenceGroup(self.d_output_gen())
+
+    def d_all_gen(self, writes=None):
+        """
+        Generate all flow, anti and output dependences.
+
+        If ``writes`` is provided, restrict the analysis to those Functions.
+        """
+        return chain(self.d_flow_gen(writes=writes),
+                     self.d_anti_gen(writes=writes),
+                     self.d_output_gen(writes=writes))
+
+    @cached_property
+    def d_all(self):
+        """All flow, anti, and output dependences."""
+        return self.d_flow + self.d_anti + self.d_output
+
+    @memoized_generator
+    def d_from_access_gen(self, accesses):
+        """
+        Generate all flow, anti, and output dependences involving any of
+        the given TimedAccess objects.
+        """
+        accesses = set(as_tuple(accesses))
+        for d in self.d_all_gen():
+            if accesses & {d.source, d.sink}:
+                yield d
+
+    @memoized_meth
+    def d_from_access(self, accesses):
+        """
+        All flow, anti, and output dependences involving any of the given
+        TimedAccess objects.
+        """
+        return DependenceGroup(self.d_from_access_gen(accesses))
+
+    @memoized_generator
+    def r_gen(self):
+        """
+        Generate the Relations of the Scope.
+        """
+        for f in self.functions:
+            v = self.reads.get(f, []) + self.writes.get(f, [])
+
+            for a0, a1 in product(v, v):
+                if a0 is a1:
+                    continue
+
+                r = Relation(a0, a1)
+                if r.is_imaginary:
+                    continue
+
+                yield r
+
+    @cached_property
+    def r_all(self):
+        """
+        All Relations of the Scope.
+        """
+        return list(self.r_gen())
+
+
+class ExprGeometry:
+
+    """
+    Geometric representation of an expression by abstracting Indexeds as
+    LabeledVectors.
+    """
+
+    def __init__(self, expr, indexeds=None, bases=None, offsets=None):
+        self.expr = expr
+
+        if indexeds is not None:
+            self.indexeds = indexeds
+            self.bases = bases
+            self.offsets = offsets
+            return
+
+        self.indexeds = retrieve_indexed(expr)
+
+        bases = []
+        offsets = []
+        for ii in self.iinstances:
+            base = []
+            offset = []
+            for e, fi, ai in zip(ii, ii.findices, ii.aindices, strict=True):
+                if ai is None:
+                    base.append((fi, e))
+                else:
+                    base.append((fi, ai))
+                    offset.append((ai, e - ai))
+            bases.append(LabeledVector(base))
+            offsets.append(LabeledVector(offset))
+
+        self.bases = bases
+        self.offsets = offsets
+
+    def __repr__(self):
+        return f"ExprGeometry(expr={self.expr})"
+
+    def translated(self, other, dims=None):
+        """
+        True if `self` is translated w.r.t. `other`, False otherwise.
+
+        Examples
+        --------
+        Two expressions are translated if they perform the same operations,
+        their bases are the same and their offsets are pairwise translated.
+
+        c := A[i,j] op A[i,j+1]     -> Toffsets = {i: [0,0], j: [0,1]}
+        u := A[i+1,j] op A[i+1,j+1] -> Toffsets = {i: [1,1], j: [0,1]}
+
+        Then `c` is translated w.r.t. `u` with distance `{i: 1, j: 0}`
+
+        The test may be strengthen by imposing that a translation occurs
+        only along a specific set of Dimensions through the kwarg `dims`.
+        """
+        # Check mathematical structure
+        if not compare_ops(self.expr, other.expr):
+            return False
+
+        # Use a suitable value for `dims` if not provided by user
+        if dims is None:
+            if self.aindices != other.aindices:
+                return False
+            dims = self.aindices
+        dims = set(as_tuple(dims))
+
+        # Check bases and offsets
+        distances = {}
+        for i in ['Tbases', 'Toffsets']:
+            Ti0 = getattr(self, i)
+            Ti1 = getattr(other, i)
+
+            m0 = dict(Ti0)
+            m1 = dict(Ti1)
+
+            # The only hope in presence of Dimensions appearing only in either
+            # `self` or `other` is that they have been projected away by the caller
+            for d in set(m0).symmetric_difference(set(m1)):
+                if not d._defines & dims:
+                    return False
+
+            for d in set(m0).union(set(m1)):
+                try:
+                    o0 = m0[d]
+                    o1 = m1[d]
+                except KeyError:
+                    continue
+
+                distance = set(o0 - o1)
+                if len(distance) != 1:
+                    return {}
+                v = distance.pop()
+
+                if not d._defines & dims and v != 0:
+                    return {}
+
+                distances[d] = v
+
+        return distances
+
+    @cached_property
+    def iinstances(self):
+        return tuple(IterationInstance(i) for i in self.indexeds)
+
+    @cached_property
+    def Tbases(self):
+        return LabeledVector.transpose(*self.bases)
+
+    @cached_property
+    def Toffsets(self):
+        return LabeledVector.transpose(*self.offsets)
+
+    @cached_property
+    def dimensions(self):
+        return frozenset(i for i, _ in self.Toffsets)
+
+    @cached_property
+    def aindices(self):
+        try:
+            return tuple(zip(*self.Toffsets, strict=True))[0]
+        except IndexError:
+            return ()
+
+    @property
+    def is_regular(self):
+        return all(i.is_regular for i in self.iinstances)
+
+
+# *** Utils
+
+def vinf(entries):
+    return Vector(*(entries + [S.Infinity]))
+
+
+def skippable_interval(d, ispace, it):
+    """
+    Return True if the IterationInterval `it` can be skipped while matching
+    the access Dimension `d` to the IterationSpace `ispace`.
+
+    Constant accesses, represented by `d=None`, do not consume an
+    IterationInterval. A non-constant access can skip `it` only if `d`
+    occurs elsewhere in `ispace`. Otherwise the access is irregular and
+    must be handled conservatively.
+
+    Examples
+    --------
+    Given `W<a,[i]>` and `R<a,[4]>` over `(r, i)`, `r` is skippable
+    for both accesses, while `i` is not skippable for the write. By contrast,
+    `x` is not skippable for `a[y]` over `(x)` because `y` does not
+    occur in the IterationSpace.
+    """
+    return d is None or (d in ispace and not d._defines & it.dim._defines)
+
+
+def disjoint_subdims(a0, a1):
+    """
+    Determine whether two TimedAccesses touch disjoint SubDimension regions
+    of the same Function.
+
+    Compare symbolic accessed bounds, including shifts and stencil points.
+    Block intervals are promoted to their logical SubDimensions. Declared
+    thicknesses determine the global regions: explicit overrides are forbidden,
+    while MPI clips these regions to each rank. Parent bounds and access offsets
+    remain symbolic; only iteration bounds use the declared thicknesses.
+
+    For example, a left SubDimension of thickness 4 ends before a middle
+    SubDimension excluding 4 points, even when the two thickness symbols are distinct.
+
+    Left/right SubDimensions of the same parent with `separated=True` satisfy
+    `L + R + space_order <= N`, checked against the full global parent extent
+    at `Operator.apply`. Their gap therefore accommodates stencil accesses;
+    larger shifts are still compared explicitly. If either SubDimension has
+    `separated=False`, no minimum separation is assumed.
+
+    Match data axes independently of the iteration nests. Return True if any
+    axis proves separation, False otherwise. Accesses over the same interval
+    use the general distance analysis.
+    """
+    for e0, e1, d0, d1 in zip(a0, a1, a0.aindices, a1.aindices, strict=False):
+        it0 = a0.intervals[d0]
+        it1 = a1.intervals[d1]
+        if it0.is_Null or it1.is_Null:
+            continue
+
+        it0 = it0.promote(lambda d: d.is_Incr)
+        it1 = it1.promote(lambda d: d.is_Incr)
+        if not (it0.dim.is_Sub and
+                it1.dim.is_Sub and
+                it0.dim.root is it1.dim.root and
+                it0 != it1):
+            continue
+
+        f = a0.function.c0
+        space_order = f.space_order if isinstance(f, Function) else 0
+        if disjoint_subdims_axis(e0, e1, d0, d1, it0, it1, space_order):
+            return True
+
+    return False
+
+
+@memoized_func(scope='build')
+def disjoint_subdims_axis(e0, e1, d0, d1, it0, it1, space_order):
+    """
+    Test separation along one data axis of two SubDimension accesses.
+
+    The result depends on the indices, intervals and stencil order, rather than
+    the access timestamps, modes or other axes. Cache it across the many
+    TimedAccess pairs and Scopes that reuse the same one-dimensional regions.
+    The cache is cleared at the end of Operator construction.
+    """
+    thicknesses = {t: t.value for it in (it0, it1)
+                   for t in it.dim.thickness if t.value is not None}
+    bounds = []
+    for e, d, it in ((e0, d0, it0), (e1, d1, it1)):
+        if not q_affine(e, d):
+            break
+
+        lower, upper = [], []
+        for v in erange(e):
+            slope = v.diff(d)
+            if slope.is_nonnegative:
+                m, M = it.symbolic_min, it.symbolic_max
+            elif slope.is_nonpositive:
+                M, m = it.symbolic_min, it.symbolic_max
+            else:
+                break
+            lower.append(v._subs(d, m.xreplace(thicknesses)))
+            upper.append(v._subs(d, M.xreplace(thicknesses)))
+        else:
+            bounds.append((sympy.Min(*lower), sympy.Max(*upper)))
+
+    if len(bounds) == 2:
+        (m0, M0), (m1, M1) = bounds
+        mapper = {}
+
+        dl, dr = (it0.dim, it1.dim) if it0.dim.is_left else (it1.dim, it0.dim)
+        dlp, drp = dl.parent, dr.parent
+
+        if dl.is_left and dr.is_right and \
+           dl.separated and dr.separated and \
+           dlp is drp:
+            # Runtime validation guarantees N - L - R >= space_order
+            gap = sympy.Dummy(nonnegative=True)
+            mapper[dlp.symbolic_max] = (dlp.symbolic_min + dl.ltkn.value +
+                                        dr.rtkn.value + space_order + gap - 1)
+
+        if (M0 - m1).subs(mapper).is_negative or \
+           (M1 - m0).subs(mapper).is_negative:
+            return True
+
+    return False
+
+
+def disjoint_test(e0, e1, d, it):
+    """
+    A rudimentary test to check if two accesses `e0` and `e1` along `d` within
+    the IterationInterval `it` are independent.
+
+    This is inspired by the Banerjee test, but it's way more simplistic.
+
+    The test is conservative, meaning that if it returns False, then the accesses
+    might be independent, but it's not guaranteed. If it returns True, then the
+    accesses are definitely independent.
+
+    Our implementation focuses on tiny yet relevant cases, such as when the
+    iteration space's bounds are numeric constants, while the index accesses
+    functions reduce to numbers once the iteration variable is substituted with
+    one of the possible values in the iteration space.
+
+    Examples
+    --------
+      * e0 = 12 - zl, e1 = zl + 4, d = zl, it = zl[0,0]
+        where zl is a left SubDimension with thickness, say, 4
+        The test will return True, as the two index access functions never
+        overlap.
+    """
+    if e0 == e1:
+        return False
+
+    if d.is_Custom:
+        subs = {}
+    elif d.is_Sub and d.is_left:
+        subs = {d.root.symbolic_min: 0, d.ltkn: d.ltkn.value}
+    else:
+        return False
+
+    m = it.symbolic_min.subs(subs)
+    M = it.symbolic_max.subs(subs)
+
+    p00 = e0._subs(d, m)
+    p01 = e0._subs(d, M)
+
+    p10 = e1._subs(d, m)
+    p11 = e1._subs(d, M)
+
+    if any(not i.is_Number for i in [p00, p01, p10, p11]):
+        return False
+
+    i0 = sympy.Interval(min(p00, p01), max(p00, p01))
+    i1 = sympy.Interval(min(p10, p11), max(p10, p11))
+
+    return not bool(i0.intersect(i1))
+
+
+def degenerating_indices(i0, i1, function, logical=False):
+    """
+    True if `i0` and `i1` are indices that are possibly symbolically
+    different, but they can be proved to systematically degenerate to the
+    same value, False otherwise.
+    """
+    # Case 1: ModuloDimensions of size 1
+    try:
+        if i0.is_Modulo and i1.is_Modulo and i0.modulo == i1.modulo == 1:
+            return True
+    except AttributeError:
+        pass
+
+    # Case 2: SteppingDimension corresponding to buffer of size 1
+    # Extract dimension from both IndexAccessFunctions -> d0, d1
+    # Skipped if doing a purely logical check
+    if not logical:
+        try:
+            d0 = i0.d
+        except AttributeError:
+            d0 = i0
+        try:
+            d1 = i1.d
+        except AttributeError:
+            d1 = i1
+
+        with suppress(AttributeError):
+            if d0 is d1 and d0.is_Stepping and function._size_domain[d0] == 1:
+                return True
+
+    return False

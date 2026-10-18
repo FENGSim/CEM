@@ -1,0 +1,2076 @@
+import numpy as np
+import pytest
+from sympy import Float, Symbol, diff, simplify, sympify
+
+from conftest import assert_structure
+from devito import (
+    NODE, ConditionalDimension, Eq, Function, Grid, Inc, Operator, SubDomain,
+    TensorFunction, TensorTimeFunction, TimeFunction, VectorFunction, centered, cos, curl,
+    div, grad, laplace, left, right, sin
+)
+from devito.finite_differences import Derivative, Differentiable, diffify
+from devito.finite_differences.differentiable import (
+    Add, DiffDerivative, EvalDerivative, IndexDerivative, IndexDerivativeProperty,
+    IndexSum, Weights, interp_for_fd
+)
+from devito.symbolics import indexify, retrieve_indexed
+from devito.types.dimension import StencilDimension
+from devito.types.grid import DerivedSubDomain
+from devito.warnings import DevitoWarning
+
+_PRECISION = 9
+
+
+def x(grid):
+    return grid.dimensions[0]
+
+
+def y(grid):
+    return grid.dimensions[1]
+
+
+def z(grid):
+    return grid.dimensions[2]
+
+
+def t(grid):
+    return grid.stepping_dim
+
+
+class TestFD:
+    """
+    Class for finite difference testing.
+    Tests the accuracy w.r.t polynomials.
+    Test that the shortcut produce the same answer as the FD functions.
+    """
+
+    def setup_method(self):
+        self.shape = (20, 20, 20)
+        self.grid = Grid(self.shape)
+
+    def test_diff(self):
+        """Test that expr.diff returns an object of type devito.Derivative."""
+        u = Function(name='u', grid=self.grid)
+        du = u.diff(x(self.grid))
+        assert isinstance(du, Derivative)
+
+    @pytest.mark.parametrize('so', [2, 3, 4, 5])
+    def test_fd_indices(self, so):
+        """
+        Test that shifted derivative have Integer offset after indexification.
+        """
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        x0 = x + .5 * x.spacing
+        u = Function(name="u", grid=grid, space_order=so)
+        dx = indexify(u.dx(x0=x0).evaluate)
+        for f in retrieve_indexed(dx):
+            assert len(f.indices[0].atoms(Float)) == 0
+
+    @pytest.mark.parametrize('SymbolType, dim', [
+        (Function, x), (Function, y),
+        (TimeFunction, x), (TimeFunction, y), (TimeFunction, t),
+    ])
+    def test_stencil_derivative(self, SymbolType, dim):
+        """Test symbolic behaviour when expanding stencil derivatives"""
+        i = dim(self.grid)
+        u = SymbolType(name='u', grid=self.grid)
+        u.data[:] = 66.6
+        di = u.diff(i)
+        dii = u.diff(i, i)
+        # Check for sympy Derivative objects
+        assert(isinstance(di, Derivative) and isinstance(dii, Derivative))
+        s_di = di.as_finite_difference([i - i.spacing, i])
+        s_dii = dii.as_finite_difference([i - i.spacing, i, i + i.spacing])
+        # Check stencil length of first and second derivatives
+        assert(len(s_di.args) == 2 and len(s_dii.args) == 3)
+        u_di = s_di.args[0].args[1]
+        u_dii = s_di.args[0].args[1]
+        # Ensure that devito meta-data survived symbolic transformation
+        assert(u_di.grid.shape == self.shape and u_dii.grid.shape == self.shape)
+        assert(u_di.shape == u.shape and u_dii.shape == u.shape)
+        assert(np.allclose(u_di.data, 66.6))
+        assert(np.allclose(u_dii.data, 66.6))
+
+    @pytest.mark.parametrize('SymbolType, derivative, dim, expected', [
+        (Function, ['dx2'], 3, 'Derivative(u(x, y, z), (x, 2))'),
+        (Function, ['dx2dy'], 3, 'Derivative(u(x, y, z), (x, 2), y)'),
+        (Function, ['dx2dydz'], 3,
+         'Derivative(u(x, y, z), (x, 2), y, z)'),
+        (Function, ['dx2', 'dy'], 3, 'Derivative(Derivative(u(x, y, z), (x, 2)), y)'),
+        (Function, ['dx2dy', 'dz2'], 3,
+         'Derivative(Derivative(u(x, y, z), (x, 2), y), (z, 2))'),
+        (TimeFunction, ['dx2'], 3, 'Derivative(u(t, x, y, z), (x, 2))'),
+        (TimeFunction, ['dx2dy'], 3, 'Derivative(u(t, x, y, z), (x, 2), y)'),
+        (TimeFunction, ['dx2', 'dy'], 3,
+         'Derivative(Derivative(u(t, x, y, z), (x, 2)), y)'),
+        (TimeFunction, ['dx', 'dy', 'dx2', 'dz', 'dydz'], 3,
+         'Derivative(Derivative(Derivative(Derivative(Derivative(' +
+         'u(t, x, y, z), x), y), (x, 2)), z), y, z)')
+    ])
+    def test_unevaluation(self, SymbolType, derivative, dim, expected):
+        u = SymbolType(name='u', grid=self.grid, time_order=2, space_order=2)
+        expr = getattr(u, derivative[0])
+        for d in derivative[1:]:
+            expr = getattr(expr, d)
+        assert(expr.__str__() == expected)
+        # Make sure the FD evaluation executes
+        _ = expr.evaluate
+
+    @pytest.mark.parametrize('expr,expected', [
+        ('u.dx + u.dy', 'Derivative(u, x) + Derivative(u, y)'),
+        ('u.dxdy', 'Derivative(u, x, y)'),
+        ('u.laplace',
+         'Derivative(u, (x, 2)) + Derivative(u, (y, 2)) + Derivative(u, (z, 2))'),
+        ('(u.dx + u.dy).dx', 'Derivative(Derivative(u, x) + Derivative(u, y), x)'),
+        ('((u.dx + u.dy).dx + u.dxdy).dx',
+         'Derivative(Derivative(Derivative(u, x) + Derivative(u, y), x) +' +
+         ' Derivative(u, x, y), x)'),
+        ('(u**4).dx', 'Derivative(u**4, x)'),
+        ('(u/4).dx', 'Derivative(u/4, x)'),
+        ('((u.dx + v.dy).dx * v.dx).dy.dz',
+         'Derivative(Derivative(Derivative(Derivative(u, x) + Derivative(v, y), x) *' +
+         ' Derivative(v, x), y), z)')
+    ])
+    def test_arithmetic(self, expr, expected):
+        x, y, z = self.grid.dimensions
+        u = Function(name='u', grid=self.grid, time_order=2, space_order=2)  # noqa
+        v = Function(name='v', grid=self.grid, time_order=2, space_order=2)  # noqa
+        expr = eval(expr)
+        expected = eval(expected)
+        assert expr == expected
+
+    @pytest.mark.parametrize('expr, rules', [
+        ('u.dx + u.dy', '{u.indices[0]: 1, u.indices[1]: 0}'),
+        ('u.dxdy - u.dxdz', '{u.indices[0]: u.indices[0] + u.indices[0].spacing,' +
+                            'u.indices[1]: 0, u.indices[2]: u.indices[1]}'),
+        ('u.dx2dy + u.dz ', '{u.indices[0]: u.indices[0] + u.indices[0].spacing,' +
+                            'u.indices[2]: u.indices[2] - 10}'),
+    ])
+    def test_derivative_eval_at(self, expr, rules):
+        u = Function(name='u', grid=self.grid, time_order=2, space_order=2)  # noqa
+        expr = eval(expr)
+        rules = eval(rules)
+        assert expr.evaluate.xreplace(rules) == expr.xreplace(rules).evaluate
+
+    @pytest.mark.parametrize('expr, rules', [
+        ('u.dx', '{u.indices[0]: 1}'),
+        ('u.dy', '{u.indices[1]: u.indices[2] - 7}'),
+        ('u.dz', '{u.indices[2]: u.indices[0] + u.indices[1].spacing}'),
+    ])
+    def test_derivative_eval_at_expr(self, expr, rules):
+        u = Function(name='u', grid=self.grid, time_order=2, space_order=2)  # noqa
+        expr = eval(expr)
+        rules = eval(rules)
+        assert expr.evaluate.xreplace(rules) == expr.xreplace(rules).evaluate
+        assert expr.expr == expr.xreplace(rules).expr
+
+    @pytest.mark.parametrize('expr, composite_rules', [
+        ('u.dx', '[{u.indices[0]: 1}, {1: 4}]'),
+    ])
+    def test_derivative_eval_at_composite(self, expr, composite_rules):
+        u = Function(name='u', grid=self.grid, time_order=2, space_order=2)  # noqa
+        expr = eval(expr)
+        evaluated_expr = expr.evaluate
+        composite_rules = eval(composite_rules)
+        for mapper in composite_rules:
+            evaluated_expr = evaluated_expr.xreplace(mapper)
+            expr = expr.xreplace(mapper)
+        assert evaluated_expr == expr.evaluate
+
+    @pytest.mark.parametrize('SymbolType, derivative, dim', [
+        (Function, 'dx2', 3), (Function, 'dy2', 3),
+        (TimeFunction, 'dx2', 3), (TimeFunction, 'dy2', 3), (TimeFunction, 'dt', 2)
+    ])
+    def test_preformed_derivatives(self, SymbolType, derivative, dim):
+        """Test the stencil expressions provided by devito objects"""
+        u = SymbolType(name='u', grid=self.grid, time_order=2, space_order=2)
+        expr = getattr(u, derivative)
+        assert(len(expr.evaluate.args) == dim)
+
+    @pytest.mark.parametrize('derivative, dim', [
+        ('dx', x), ('dy', y), ('dz', z)
+    ])
+    @pytest.mark.parametrize('order', [1, 2, 4, 6, 8, 10, 12, 14, 16])
+    def test_derivatives_space(self, derivative, dim, order):
+        """Test first derivative expressions against native sympy"""
+        dim = dim(self.grid)
+        u = TimeFunction(name='u', grid=self.grid, time_order=2, space_order=order)
+        expr = getattr(u, derivative).evaluate
+        # Establish native sympy derivative expression
+        width = int(order / 2)
+        if order <= 2:
+            indices = [dim, dim + dim.spacing]
+        else:
+            indices = [(dim + i * dim.spacing) for i in range(-width, width + 1)]
+
+        s_expr = u.diff(dim).as_finite_difference(indices).evalf(_PRECISION)
+        assert(simplify(expr - s_expr) == 0)  # Symbolic equality
+        assert type(expr) is EvalDerivative
+        expr1 = s_expr.func(*expr.args)
+        assert(expr1 == s_expr)  # Exact equality
+
+    @pytest.mark.parametrize('derivative, dim', [
+        ('dx2', x), ('dy2', y), ('dz2', z)
+    ])
+    @pytest.mark.parametrize('order', [2, 4, 6, 8, 10, 12, 14, 16])
+    def test_second_derivatives_space(self, derivative, dim, order):
+        """
+        Test second derivative expressions against native sympy.
+        """
+        dim = dim(self.grid)
+        u = TimeFunction(name='u', grid=self.grid, time_order=2, space_order=order)
+        expr = getattr(u, derivative).evaluate
+        # Establish native sympy derivative expression
+        width = int(order / 2)
+        indices = [(dim + i * dim.spacing) for i in range(-width, width + 1)]
+        s_expr = u.diff(dim, dim).as_finite_difference(indices).evalf(_PRECISION)
+        assert(simplify(expr - s_expr) == 0)  # Symbolic equality
+        assert type(expr) is EvalDerivative
+        expr1 = s_expr.func(*expr.args)
+        assert(expr1 == s_expr)  # Exact equality
+
+    @pytest.mark.parametrize('space_order', [2, 4, 6, 8, 10, 12, 14, 16, 18, 20])
+    # Only test x and t as y and z are the same as x
+    @pytest.mark.parametrize('derivative', ['dx', 'dxl', 'dxr', 'dx2'])
+    def test_fd_space(self, derivative, space_order):
+        """
+        This test compares the discrete finite-difference scheme against polynomials
+        For a given order p, the finite difference scheme should
+        be exact for polynomials of order p.
+        """
+        # dummy axis dimension
+        nx = 100
+        xx = np.linspace(-1, 1, nx)
+        dx = xx[1] - xx[0]
+        # Symbolic data
+        grid = Grid(shape=(nx,), dtype=np.float32)
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=space_order)
+        du = Function(name="du", grid=grid, space_order=space_order)
+        # Define polynomial with exact fd
+        coeffs = np.ones((space_order,), dtype=np.float32)
+        polynome = sum([coeffs[i]*x**i for i in range(0, space_order)])
+        polyvalues = np.array([polynome.subs(x, xi) for xi in xx], np.float32)
+        # Fill original data with the polynomial values
+        u.data[:] = polyvalues
+        # True derivative of the polynome
+        Dpolynome = diff(diff(polynome)) if derivative == 'dx2' else diff(polynome)
+        Dpolyvalues = np.array([Dpolynome.subs(x, xi) for xi in xx], np.float32)
+        # FD derivative, symbolic
+        u_deriv = getattr(u, derivative)
+        # Compute numerical FD
+        stencil = Eq(du, u_deriv)
+        op = Operator(stencil, subs={x.spacing: dx})
+        op.apply()
+
+        # Check exactness of the numerical derivative except inside space_brd
+        space_border = space_order
+        error = abs(du.data[space_border:-space_border] -
+                    Dpolyvalues[space_border:-space_border])
+        assert np.isclose(np.mean(error), 0., atol=1e-3)
+
+    @pytest.mark.parametrize('staggered', [(True, True), (False, False),
+                                           (True, False), (False, True)])
+    @pytest.mark.parametrize('space_order', [2, 4, 6, 8, 10, 12, 14, 16, 18, 20])
+    @pytest.mark.parametrize('ndim', [2, 3])
+    def test_fd_space_45(self, staggered, space_order, ndim):
+        """
+        Rotated derivatives require at least 2D to get access to diagonal points.
+        We create a simple 1D gradient over a 2D grid to check against a polynomial
+        """
+        # dummy axis dimension
+        nx = 100
+        xx = np.linspace(-1, 1, nx)
+        dx = xx[1] - xx[0]
+        if staggered[0] and not staggered[1]:
+            xx_s = xx + dx/2
+        elif not staggered[0] and staggered[1]:
+            xx_s = xx - dx/2
+        else:
+            xx_s = xx
+        # Symbolic data
+        grid = Grid(shape=tuple([nx]*ndim), dtype=np.float32)
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=space_order,
+                     staggered=None if staggered[0] else grid.dimensions)
+        du = Function(name="du", grid=grid, space_order=space_order,
+                      staggered=None if staggered[1] else grid.dimensions)
+        # Define polynomial with exact fd
+        coeffs = np.ones((space_order,), dtype=np.float32)
+        polynome = sum([coeffs[i]*x**i for i in range(0, space_order)])
+        polyvalues = np.array([polynome.subs(x, xi) for xi in xx], np.float32)
+        # Fill original data with the polynomial values
+        u.data[:] = polyvalues.reshape(nx, *[1]*(ndim-1))
+        # True derivative of the polynome
+        Dpolynome = diff(polynome)
+        Dpolyvalues = np.array([Dpolynome.subs(x, xi) for xi in xx_s], np.float32)
+        # FD derivative, symbolic
+        u_deriv = u.dx45
+        # Compute numerical FD
+        stencil = Eq(du, u_deriv)
+        op = Operator(stencil, subs={d.spacing: dx for d in grid.dimensions})
+        op.apply()
+
+        # Check exactness of the numerical derivative except inside space_brd
+        space_border = space_order
+        mid = tuple([slice(space_border, -space_border, 1)] +
+                    [nx//2 for i in range(ndim-1)])
+        error = abs(du.data[mid] -
+                    Dpolyvalues[space_border:-space_border])
+
+        assert np.isclose(np.mean(error), 0., atol=1e-3)
+
+    @pytest.mark.parametrize('stagger', [centered, left, right])
+    @pytest.mark.parametrize('space_order', [2, 4, 6, 8, 10, 12, 14, 16, 18, 20])
+    # Only test x and t as y and z are the same as x
+    def test_fd_space_staggered(self, space_order, stagger):
+        """
+        This test compares the discrete finite-difference scheme against polynomials
+        For a given order p, the finite difference scheme should
+        be exact for polynomials of order p
+        """
+        # dummy axis dimension
+        nx = 101
+        xx = np.linspace(-1, 1, nx)
+        dx = xx[1] - xx[0]
+        # Symbolic data
+        grid = Grid(shape=(nx,), dtype=np.float32)
+        x = grid.dimensions[0]
+
+        # Location of the staggered function
+        if stagger == left:
+            off = -.5
+            side = -x
+            xx_u = xx + off * dx
+            duside = NODE
+            xx_du = xx
+        elif stagger == right:
+            off = .5
+            side = x
+            xx_u = xx + off * dx
+            duside = NODE
+            xx_du = xx
+        else:
+            side = NODE
+            xx_u = xx
+            xx_du = xx + .5 * dx
+            duside = x
+
+        u = Function(name="u", grid=grid, space_order=space_order, staggered=side)
+        du = Function(name="du", grid=grid, space_order=space_order, staggered=duside)
+        # Define polynomial with exact fd
+        coeffs = np.ones((space_order-1,), dtype=np.float32)
+        polynome = sum([coeffs[i]*x**i for i in range(0, space_order-1)])
+        polyvalues = np.array([polynome.subs(x, xi) for xi in xx_u], np.float32)
+        # Fill original data with the polynomial values
+        u.data[:] = polyvalues
+        # True derivative of the polynome
+        Dpolynome = diff(polynome)
+        Dpolyvalues = np.array([Dpolynome.subs(x, xi) for xi in xx_du], np.float32)
+        # Compute numerical FD
+        stencil = Eq(du, u.dx)
+        op = Operator(stencil, subs={x.spacing: dx})
+        op.apply()
+
+        # Check exactness of the numerical derivative except inside space_brd
+        space_border = space_order
+        error = abs(du.data[space_border:-space_border] -
+                    Dpolyvalues[space_border:-space_border])
+
+        assert np.isclose(np.mean(error), 0., atol=1e-3)
+
+    @pytest.mark.parametrize('so', [2, 4, 6, 8])
+    def test_fd_new_order(self, so):
+        grid = Grid((10,))
+        u = Function(name="u", grid=grid, space_order=so)
+        u1 = Function(name="u", grid=grid, space_order=so//2)
+        u2 = Function(name="u", grid=grid, space_order=so//2 + 1)
+        assert str(u.dx(fd_order=so//2).evaluate) == str(u1.dx.evaluate)
+        assert str(u.dx(fd_order=so//2 + 1).evaluate) == str(u2.dx.evaluate)
+
+    def test_xderiv_order(self):
+        grid = Grid(shape=(11, 11), extent=(10., 10.))
+        x, y = grid.dimensions
+        f = Function(name='f', grid=grid, space_order=4)
+
+        # Check that supplying a dictionary to fd_order for x-derivs functions correctly
+        expr = f.dxdy(fd_order={x: 2, y: 2}).evaluate \
+            - f.dx(fd_order=2).dy(fd_order=2).evaluate
+        assert simplify(expr) == 0
+
+    def test_xderiv_x0(self):
+        grid = Grid(shape=(11, 11), extent=(10., 10.))
+        x, y = grid.dimensions
+        h_x = x.spacing
+        h_y = y.spacing
+        f = Function(name='f', grid=grid, space_order=4)
+
+        # Check that supplying a dictionary to x0 for x-derivs functions correctly
+        expr = f.dxdy(x0={x: x+h_x/2, y: y+h_y/2}).evaluate \
+            - f.dx(x0=x+h_x/2).dy(x0=y+h_y/2).evaluate
+        assert simplify(expr) == 0
+
+        # Check x0 is correctly set
+        dfdxdx = f.dx(x0=x+h_x/2).dx(x0=x-h_x/2)
+        assert dict(dfdxdx.x0) == {x: x-h_x/2}
+        assert dict(dfdxdx.expr.x0) == {x: x+h_x/2}
+
+    def test_fd_new_side(self):
+        grid = Grid((10,))
+        u = Function(name="u", grid=grid, space_order=4)
+        assert u.dx(side=left).evaluate == u.dxl.evaluate
+        assert u.dx(side=right).evaluate == u.dxr.evaluate
+        assert u.dxl(side=centered).evaluate == u.dx.evaluate
+
+    @pytest.mark.parametrize('so, expected', [
+        (2, 'u(x)/h_x - u(x - h_x)/h_x'),
+        (4, '1.125*u(x)/h_x + 0.0416666667*u(x - 2*h_x)/h_x - '
+            '1.125*u(x - h_x)/h_x - 0.0416666667*u(x + h_x)/h_x'),
+        (6, '1.171875*u(x)/h_x - 0.0046875*u(x - 3*h_x)/h_x + '
+            '0.0651041667*u(x - 2*h_x)/h_x - 1.171875*u(x - h_x)/h_x - '
+            '0.0651041667*u(x + h_x)/h_x + 0.0046875*u(x + 2*h_x)/h_x'),
+        (8, '1.19628906*u(x)/h_x + 0.000697544643*u(x - 4*h_x)/h_x - '
+            '0.0095703125*u(x - 3*h_x)/h_x + 0.0797526042*u(x - 2*h_x)/h_x - '
+            '1.19628906*u(x - h_x)/h_x - 0.0797526042*u(x + h_x)/h_x + '
+            '0.0095703125*u(x + 2*h_x)/h_x - 0.000697544643*u(x + 3*h_x)/h_x')])
+    def test_fd_new_x0(self, so, expected):
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=so)
+        assert u.dx(x0=x + x.spacing).evaluate == u.dx.evaluate.subs({x: x + x.spacing})
+        assert u.dx(x0=x - x.spacing).evaluate == u.dx.evaluate.subs({x: x - x.spacing})
+        # half shifted compare to explicit coeffs (Forneberg)
+        assert str(u.dx(x0=x - .5 * x.spacing).evaluate) == expected
+
+    def test_new_x0_eval_at(self):
+        """
+        Make sure that explicitly set x0 does not get overwritten by eval_at.
+        """
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=2)
+        v = Function(name="v", grid=grid, space_order=2)
+        assert u.dx(x0=x - x.spacing/2)._eval_at(v).x0 == {x: x - x.spacing/2}
+
+    @pytest.mark.parametrize('stagg', [True, False])
+    def test_eval_at_centered(self, stagg):
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        stagg = NODE if stagg else x
+        x0 = x if stagg else x + .5 * x.spacing
+
+        u = Function(name="u", grid=grid, space_order=2, staggered=stagg)
+        v = Function(name="v", grid=grid, space_order=2, staggered=stagg)
+
+        assert u.dx._eval_at(v).evaluate == u.dx(x0=x0).evaluate
+        assert v.dx._eval_at(u).evaluate == v.dx(x0=x0).evaluate
+        assert u.dx._eval_at(u).evaluate == u.dx.evaluate
+
+    def test_fd_new_lo(self):
+        grid = Grid((10,))
+        x = grid.dimensions[0]
+        u = Function(name="u", grid=grid, space_order=2)
+
+        dplus = "-u(x)/h_x + u(x + h_x)/h_x"
+        dminus = "u(x)/h_x - u(x - h_x)/h_x"
+        assert str(u.dx(x0=x + .5 * x.spacing).evaluate) == dplus
+        assert str(u.dx(x0=x - .5 * x.spacing).evaluate) == dminus
+        assert str(u.dx(x0=x + .5 * x.spacing, fd_order=1).evaluate) == dplus
+        assert str(u.dx(x0=x - .5 * x.spacing, fd_order=1).evaluate) == dminus
+
+    def test_subsampled_fd(self):
+        """
+        Test that the symbolic interface is working for space subsampled
+        functions.
+        """
+        nt = 19
+        grid = Grid(shape=(12, 12), extent=(11, 11))
+
+        u = TimeFunction(name='u', grid=grid, save=nt, space_order=2)
+        assert(grid.time_dim in u.indices)
+
+        # Creates subsampled spatial dimensions and according grid
+        dims = tuple([ConditionalDimension(d.name+'sub', parent=d, factor=2)
+                      for d in u.grid.dimensions])
+        grid2 = Grid((6, 6), dimensions=dims, extent=(10, 10))
+        u2 = TimeFunction(name='u2', grid=grid2, save=nt, space_order=1)
+        for i in range(nt):
+            for j in range(u2.data_with_halo.shape[2]):
+                u2.data_with_halo[i, :, j] = np.arange(u2.data_with_halo.shape[2])
+
+        eqns = [Eq(u.forward, u + 1.), Eq(u2.forward, u2.dx)]
+        op = Operator(eqns)
+
+        # NOTE: To assert against u.data[-1] we need to provide explicit bounds
+        # for x_M and y_M, otherwise they wouldn't be necessary as it wouldn't
+        # matter whether we run up to x_M=10 or x_M=11 !
+        op.apply(time_M=nt-2, x_M=11, y_M=11)
+
+        # Verify that u2[1, x,y]= du2/dx[0, x, y]
+        assert np.allclose(u.data[-1], nt-1)
+        assert np.allclose(u2.data[1], 0.5)
+
+    @pytest.mark.parametrize('expr,expected', [
+        ('f.dx', '-f(x)/h_x + f(x + h_x)/h_x'),
+        ('f.dx + g.dx', '-f(x)/h_x + f(x + h_x)/h_x - g(x)/h_x + g(x + h_x)/h_x'),
+        ('-f', '-f(x)'),
+        ('-(f + g)', '-f(x) - g(x)')
+    ])
+    def test_shortcuts(self, expr, expected):
+        grid = Grid(shape=(10,))
+        f = Function(name='f', grid=grid)  # noqa
+        g = Function(name='g', grid=grid)  # noqa
+
+        expr = eval(expr)
+
+        assert isinstance(expr, Differentiable)
+        assert expected == str(expr.evaluate)
+
+    @pytest.mark.parametrize('so', [2, 5, 8])
+    def test_all_shortcuts(self, so):
+        """
+        Test that verify that all fd shortcuts are functional.
+        """
+        grid = Grid(shape=(10, 10, 10))
+        f = Function(name='f', grid=grid, space_order=so)
+        g = TimeFunction(name='g', grid=grid, space_order=so)
+
+        for fd in f._fd:
+            assert getattr(f, fd)
+
+        for fd in g._fd:
+            assert getattr(g, fd)
+
+        for d in grid.dimensions:
+            assert f'd{d.name}' in f._fd
+            assert f'd{d.name}' in g._fd
+            for o in range(2, min(7, so+1)):
+                assert f'd{d.name}{o}' in f._fd
+                assert f'd{d.name}{o}' in g._fd
+
+    def test_shortcuts_mixed(self):
+        grid = Grid(shape=(10,))
+        f = Function(name='f', grid=grid, space_order=2)
+        g = Function(name='g', grid=grid, space_order=4)
+        assert 'dx4' not in (f*g)._fd
+        assert 'dx4' not in (f+g)._fd
+        assert 'dx4' not in (g*f.dx)._fd
+
+    def test_transpose_simple(self):
+        grid = Grid(shape=(4, 4))
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        assert str(f.dx.T.evaluate) == ("-0.0833333333*f(t, x - 2*h_x, y)/h_x "
+                                        "+ 0.666666667*f(t, x - h_x, y)/h_x "
+                                        "- 0.666666667*f(t, x + h_x, y)/h_x "
+                                        "+ 0.0833333333*f(t, x + 2*h_x, y)/h_x")
+
+    @pytest.mark.parametrize('so', [2, 4, 8, 12])
+    @pytest.mark.parametrize('ndim', [1, 2])
+    @pytest.mark.parametrize('derivative, adjoint_name', [
+        ('dx', 'dx'),
+        ('dx2', 'dx2'),
+        ('dxl', 'dxr'),
+        ('dxr', 'dxl')])
+    def test_fd_adjoint(self, so, ndim, derivative, adjoint_name):
+        grid = Grid(shape=tuple([51]*ndim), extent=tuple([25]*ndim))
+        x = grid.dimensions[0]
+        f = Function(name='f', grid=grid, space_order=so)
+        f_deriv = Function(name='f_deriv', grid=grid, space_order=so)
+        g = Function(name='g', grid=grid, space_order=so)
+        g_deriv = Function(name='g_deriv', grid=grid, space_order=so)
+
+        # Fill f and g with smooth cos/sin
+        Operator([Eq(g, x*cos(2*np.pi*x/5)), Eq(f, sin(2*np.pi*x/8))]).apply()
+        # Check symbolic expression are expected ones for the adjoint .T
+        deriv = getattr(f, derivative)
+        coeff = 1 if derivative == 'dx2' else -1
+        expected = coeff * getattr(f, derivative).evaluate.subs({x.spacing: -x.spacing})
+        assert simplify(deriv.T.evaluate) == simplify(bypass_uneval(expected))
+
+        # Compute numerical derivatives and verify dot test
+        #  i.e <f.dx, g> = <f, g.dx.T>
+
+        eq_f = Eq(f_deriv, deriv)
+        eq_g = Eq(g_deriv, getattr(g, derivative).T)
+
+        op = Operator([eq_f, eq_g])
+        op()
+
+        a = np.dot(f_deriv.data.reshape(-1), g.data.reshape(-1))
+        b = np.dot(g_deriv.data.reshape(-1), f.data.reshape(-1))
+        assert np.isclose(1 - a/b, 0, atol=1e-5)
+
+    @pytest.mark.parametrize('shift, ndim', [(None, 2), (.5, 2), (.5, 3),
+                                             ((.5, .5, .5), 3)])
+    def test_shifted_div(self, shift, ndim):
+        grid = Grid(tuple([11]*ndim))
+        f = Function(name="f", grid=grid, space_order=4)
+        for order in [None, 2]:
+            df = div(f, shift=shift, order=order).evaluate
+            ref = 0
+            for i, d in enumerate(grid.dimensions):
+                x0 = (None if shift is None else d + shift[i] * d.spacing if
+                      type(shift) is tuple else d + shift * d.spacing)
+                ref += getattr(f, f'd{d.name}')(x0=x0, fd_order=order)
+            assert df == ref.evaluate
+
+    @pytest.mark.parametrize('shift, ndim', [(None, 2), (.5, 2), (.5, 3),
+                                             ((.5, .5, .5), 3)])
+    def test_shifted_grad(self, shift, ndim):
+        grid = Grid(tuple([11]*ndim))
+        f = Function(name="f", grid=grid, space_order=4)
+        for order in [None, 2]:
+            g = grad(f, shift=shift, order=order).evaluate
+            for i, (d, gi) in enumerate(zip(grid.dimensions, g, strict=True)):
+                x0 = (None if shift is None else d + shift[i] * d.spacing if
+                      type(shift) is tuple else d + shift * d.spacing)
+                gk = getattr(f, f'd{d.name}')(x0=x0, fd_order=order).evaluate
+                assert gi == gk
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_grad_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = Function(name='f', grid=grid, space_order=2)
+
+        # Want to check that it's the same as constructing by hand. Note that
+        # all the subsequent tests of this flavor work in the same way.
+        comps = (f.dx(side=side), f.dy(side=side))
+        expr1 = VectorFunction(name=f"{f.name}_vec", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.grad(side=side).evaluate
+        assert expr1 == grad(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_vector_grad_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = VectorFunction(name='f', grid=grid, space_order=2, staggered=(None, None))
+
+        comps = ((f[0].dx(side=side), f[0].dy(side=side)),
+                 (f[1].dx(side=side), f[1].dy(side=side)))
+
+        expr1 = TensorFunction(name=f"{f.name}_tens", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.grad(side=side).evaluate
+        assert expr1 == grad(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_div_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = VectorFunction(name='f', grid=grid, space_order=2, staggered=(None, None))
+
+        expr1 = (f[0].dx(side=side) + f[1].dy(side=side)).evaluate
+
+        assert expr1 == f.div(side=side).evaluate
+        assert expr1 == div(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_tensor_div_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = TensorFunction(name='f', grid=grid, space_order=2,
+                           staggered=((None, None), (None, None)))
+
+        comps = (f[0, 0].dx(side=side) + f[0, 1].dy(side=side),
+                 f[0, 1].dx(side=side) + f[1, 1].dy(side=side))
+
+        expr1 = VectorFunction(name=f"{f.name}_vec", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.div(side=side).evaluate
+        assert expr1 == div(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_curl_w_side(self, side):
+        grid = Grid(shape=(11, 11, 11))
+        f = VectorFunction(name='f', grid=grid, space_order=2,
+                           staggered=(None, None, None))
+
+        comps = (f[2].dy(side=side) - f[1].dz(side=side),
+                 f[0].dz(side=side) - f[2].dx(side=side),
+                 f[1].dx(side=side) - f[0].dy(side=side))
+
+        expr1 = VectorFunction(name=f"{f.name}_vec", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.curl(side=side).evaluate
+        assert expr1 == curl(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_laplace_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = Function(name='f', grid=grid, space_order=2)
+
+        expr1 = (f.dx2(side=side) + f.dy2(side=side)).evaluate
+
+        assert expr1 == f.laplacian(side=side).evaluate
+        assert expr1 == laplace(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [left, right, centered])
+    def test_vector_laplace_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = VectorFunction(name='f', grid=grid, space_order=2, staggered=(None, None))
+
+        comps = (f[0].dx2(side=side) + f[0].dy2(side=side),
+                 f[1].dx2(side=side) + f[1].dy2(side=side))
+
+        expr1 = VectorFunction(name=f"{f.name}_vec", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.laplacian(side=side).evaluate
+        assert expr1 == laplace(f, side=side).evaluate
+
+    @pytest.mark.parametrize('side', [centered])
+    def test_tensor_laplace_w_side(self, side):
+        grid = Grid(shape=(11, 11))
+        f = TensorFunction(name='f', grid=grid, space_order=2,
+                           staggered=((None, None), (None, None)))
+
+        comps = (f[0, 0].dx2(side=side) + f[0, 1].dy2(side=side),
+                 f[0, 1].dx2(side=side) + f[1, 1].dy2(side=side))
+
+        expr1 = VectorFunction(name=f"{f.name}_vec", space_order=f.space_order,
+                               components=comps, grid=grid).evaluate
+
+        assert expr1 == f.laplacian(side=side).evaluate
+        assert expr1 == laplace(f, side=side).evaluate
+
+    def test_substitution(self):
+        grid = Grid((11, 11))
+        f = Function(name="f", grid=grid, space_order=4)
+        expr = f.dx + f + 1
+
+        assert simplify(expr.subs(f.dx, 1) - (f + 2)) == 0
+        # f.dx.subs(f, -1) = 0 and f.subs(f, -1) = -1 so
+        # expr.subs(f, -1) = 0
+        assert simplify(expr.subs(f, -1)) == 0
+        # f.dx -> 1, f -> -1
+        assert simplify(expr.subs({f.dx: 1, f: -1}) - 1) == 0
+
+        expr2 = expr.subs({'x0': 2})
+        # Expression should now be the same but with a different x0
+        assert simplify(expr2 - (f.dx(x0=2) + f + 1)) == 0
+        # Different x0, should no replace
+        assert simplify(expr2.subs(f.dx, 1) - expr2) == 0
+
+        # x0 and f.dx
+        expr3 = expr.subs({f.dx: f.dx2, 'x0': 2})
+        assert simplify(expr3 - (f.dx2(x0=2) + f + 1)) == 0
+
+        # Test substitution with reconstructed objects
+        x, y = grid.dimensions
+        f1 = f.func(x + 1, y)
+        f2 = f.func(x + 1, y)
+        assert f1 is not f2
+        assert f1.subs(f2, -1) == -1
+
+    def test_zero_spec(self):
+        """
+        Test that derivatives specified as Derivative(f, (x, 2), (y, 0)) are
+        correctly handled.
+        """
+        grid = Grid((11, 11))
+        x, y = grid.dimensions
+        f = Function(name="f", grid=grid, space_order=2)
+        # Check that both specifications match
+        drv0 = Derivative(f, (x, 2))
+        drv1 = Derivative(f, (x, 2), (y, 0))
+        assert drv0.dims == (x,)
+        assert drv1.dims == (x, y)
+        assert drv0.fd_order == (2,)
+        assert drv1.fd_order == (2, 2)
+        assert drv0.deriv_order == (2,)
+        assert drv1.deriv_order == (2, 0)
+
+        assert drv0.evaluate == drv1.evaluate
+        fmean = .5 * (f + f._subs(y, y + y.spacing))
+        drv1x0 = drv1(x0={y: y+y.spacing/2}).evaluate
+
+        assert simplify(fmean.dx2.evaluate - drv1x0) == 0
+
+        # Check that substitution can applied correctly
+        expr0 = drv0 + 1
+        expr1 = drv1 + 1
+        assert expr0.subs(drv0, drv1) == expr1
+        assert expr1.subs(drv1, drv0) == expr0
+
+    def test_zero_fd_interp(self):
+        """
+        Test that zero-order derivatives are generating interpolation coefficients
+        """
+        grid = Grid((11,))
+        x, = grid.dimensions
+        f = Function(name="f", grid=grid, space_order=4)
+
+        assert Derivative(f, x, deriv_order=0).evaluate == f
+        expected = (-f.subs(x, x - x.spacing) / 16 + f.subs(x, x) * 9 / 16 +
+                    f.subs(x, x + x.spacing) * 9 / 16 - f.subs(x, x + 2*x.spacing) / 16)
+        finterp = Derivative(f, (x, 0), x0={x: x+x.spacing/2}).evaluate
+        assert simplify(finterp - expected) == 0
+
+    def test_deriv_spec(self):
+        grid = Grid((11, 11))
+        x, y = grid.dimensions
+        f = Function(name="f", grid=grid, space_order=4)
+
+        assert f.dx(x0=x + x.spacing) == f.dx(x0={x: x + x.spacing})
+        assert Derivative(f, x, 1) == Derivative(f, (x, 1))
+
+        x0xy = {x: x+x.spacing/2, y: y+y.spacing/2}
+        dxy0 = Derivative(f, (x, 0), (y, 0), x0=x0xy)
+        dxy02 = Derivative(f, x, y, deriv_order=(0, 0), x0=x0xy)
+        assert dxy0 == dxy02
+        assert dxy0.dims == (x, y)
+        assert dxy0.deriv_order == (0, 0)
+        assert dxy0.fd_order == (4, 4)
+        assert dxy0.x0 == x0xy
+
+        dxy0 = Derivative(f, (x, 0), (y, 0), x0={y: y+y.spacing/2})
+        dxy02 = Derivative(f, x, y, deriv_order=(0, 0), x0={x: x+x.spacing/2})
+        assert dxy0 != dxy02
+        assert dxy0.x0 == {y: y+y.spacing/2}
+        assert dxy02.x0 == {x: x+x.spacing/2}
+
+    def test_deriv_stagg_plain(self):
+        grid = Grid((11, 11))
+        x, y = grid.dimensions
+        f1 = Function(name="f1", grid=grid, space_order=2, staggered=NODE)
+        f2 = Function(name="f2", grid=grid, space_order=2, staggered=NODE)
+
+        eq0 = Eq(f1, f2.laplace).evaluate
+        assert eq0.rhs == f2.laplace.evaluate
+        assert eq0.rhs != 0
+
+    def test_issue_2442(self):
+        grid = Grid((11, 11))
+        f = Function(name="f", grid=grid, space_order=2)
+
+        dfdxdy = f.dxdy(side=centered).evaluate
+        dfdxdy_split = f.dxc.dyc
+        assert dfdxdy.evaluate == dfdxdy_split.evaluate
+
+    def test_cross_newnest(self):
+        grid = Grid((11, 11))
+        f = Function(name="f", grid=grid, space_order=2)
+
+        assert simplify((f.dxdy - f.dx.dy).evaluate) == 0
+
+    def test_nested_call(self):
+        grid = Grid((11, 11))
+        x, y = grid.dimensions
+        f = Function(name="f", grid=grid, space_order=8)
+
+        deriv = Derivative(f, x, y, deriv_order=(0, 0), fd_order=(2, 2),
+                           x0={x: x-x.spacing/2, y: y+y.spacing/2}).dy(x0=y-y.spacing/2)
+
+        derivc = Derivative(f.dy(x0=y-y.spacing/2), x, y, deriv_order=(0, 0),
+                            fd_order=(2, 2), x0={x: x-x.spacing/2, y: y+y.spacing/2})
+
+        assert deriv.expr.fd_order == (2, 2)
+        assert deriv.expr.deriv_order == (0, 0)
+        assert deriv.expr.x0 == {x: x-x.spacing/2, y: y+y.spacing/2}
+
+        # Should be commutative
+        assert simplify(deriv.evaluate - derivc.evaluate) == 0
+
+    def test_param_stagg_inner(self):
+        space_order = 2
+        nx, ny = 5, 5
+
+        grid = Grid((nx, ny))
+
+        x, y = grid.dimensions
+        yp = y + y.spacing / 2
+        xp = x + x.spacing / 2
+
+        f = TimeFunction(name="f", grid=grid, space_order=space_order, staggered=y)
+        p = Function(name="p", grid=grid, space_order=space_order)
+        g = TimeFunction(name="g", grid=grid, space_order=space_order, staggered=(x, y))
+
+        eqn = Eq(g, (p * f).dx)
+        eqne = eqn.evaluate.rhs
+        assert simplify(eqne - (p._subs(y, yp).evaluate * f).dx(x0=xp).evaluate) == 0
+
+    def test_param_stagg_add(self):
+        space_order = 2
+        nx, ny = 5, 5
+        extent = (nx-1, ny-1)
+
+        grid = Grid(shape=(nx, ny), extent=extent)
+        x, y = grid.dimensions
+        yp = y + y.spacing / 2
+        xp = x + x.spacing / 2
+
+        x, y = grid.dimensions
+
+        vx = TimeFunction(name="vx", grid=grid, space_order=space_order,
+                          time_order1=1, staggered=x)
+        txx = TimeFunction(name="txx", grid=grid, space_order=space_order,
+                           time_order=1, staggered=NODE)
+        txy = TimeFunction(name="txy", grid=grid, space_order=space_order,
+                           time_order=1, staggered=(x, y))
+        c11 = Function(name="c11", grid=grid, space_order=space_order)
+        c66 = Function(name="c66", grid=grid, space_order=space_order)
+
+        eq0 = Eq(vx, (c66 * txy).dy)
+        eq1 = Eq(vx, (c11 * txx).dy)
+        eq2 = Eq(vx, (c11 * txx + c66 * txy).dy)
+
+        # Expects to evaluate c66 at xp then the derivative at yp
+        expect0 = (c66.subs({x: xp, y: yp}).evaluate * txy).dy.evaluate
+        assert simplify(eq0.evaluate.rhs - expect0) == 0
+
+        # Expects to evaluate c11 and txy at xp then the derivative at yp
+        expect1 = (interp_for_fd((c11 * txx), {x: xp}).evaluate).dy.evaluate
+        assert simplify(eq1.evaluate.rhs - expect1) == 0
+
+        # Addition should apply the same logic as above for each term
+        assert simplify(eq2.evaluate.rhs - (expect1 + expect0)) == 0
+
+    def test_unexpand_space_interp_w_saved_timefunc(self):
+        grid = Grid(shape=(3, 3, 3))
+
+        tau = TensorTimeFunction(name="tau", grid=grid, save=10)
+
+        eq = Eq(tau[0, 1], tau[2, 2])
+
+        op = Operator(eq, opt=('advanced', {'expand': False}))
+
+        assert_structure(op, ['t,x,y,z', 't,x,y,z,i1', 't,x,y,z,i1,i0'])
+
+
+class TestWeights:
+
+    @pytest.mark.parametrize('coeffs,expected', [
+        ((1, 2, -2, -1), -1),
+        ((1, 2, 0, -2, -1), -1),
+        ((1, 2, 2, 1), 1),
+        ((1, 2, 3, 2, 1), 1),
+        ((1, 2, 3, -2, -1), None),
+        ((0, 0, 0), 1),
+        ((0,), 1),
+        ((3,), 1),
+        ((Symbol('a'), 0, -Symbol('a')), -1),
+        ((Symbol('a'), Symbol('b'), Symbol('a')), 1),
+        ((Symbol('a'), Symbol('b')), None),
+    ])
+    def test_symmetry(self, coeffs, expected):
+        i = StencilDimension('i', 0, len(coeffs) - 1)
+        weights = Weights(name='w', dimensions=i, initvalue=coeffs)
+
+        assert weights.symmetry == expected
+        assert weights._rebuild().symmetry == expected
+
+    @pytest.mark.parametrize('coeffs,expected,offset,sign', [
+        ((0, 1, 2, -2, -1), (1, 2, -2, -1), 1, -1),
+        ((1, 2, -2, -1, 0), (1, 2, -2, -1), 0, -1),
+        ((0, 0, 1, 2, 2, 1, 0), (1, 2, 2, 1), 2, 1),
+        ((0, 1, 2, -2, -1, 0), (0, 1, 2, -2, -1, 0), 0, -1),
+        ((0, 1, 2, 3, 0), (1, 2, 3), 1, None),
+        ((1, 2, 3), (1, 2, 3), 0, None),
+        ((0, 0, 0), (0, 0, 0), 0, 1),
+        ((0, Symbol('a'), -Symbol('a')), (Symbol('a'), -Symbol('a')), 1, -1),
+    ])
+    def test_coefficient_span(self, coeffs, expected, offset, sign):
+        i = StencilDimension('i', -3, len(coeffs) - 4)
+        weights = Weights(name='w', dimensions=i, initvalue=coeffs)
+        span, start = weights.coefficient_span
+
+        assert span.weights == expected
+        assert span.symmetry == sign
+        assert start == offset
+        assert span.dimension._min == i._min + offset
+        assert span.dimension._size == len(expected)
+        assert weights.coefficient_span[0] is span
+        assert weights._rebuild().coefficient_span == (span, start)
+        if coeffs == expected:
+            assert span is weights
+
+
+class TestTwoStageEvaluation:
+
+    def test_exceptions(self):
+        grid = Grid((10,))
+
+        x, = grid.dimensions
+
+        with pytest.raises(TypeError):
+            # Missing 1 required positional argument: '_max'
+            StencilDimension('i', 3)
+        with pytest.raises(ValueError):
+            # Spacing must be an integer
+            StencilDimension('i', 3, 5, spacing=0.6)
+        i = StencilDimension('i', 0, 1)
+        assert i.symbolic_size == 2
+
+        u = Function(name="u", grid=grid, space_order=2)
+
+        with pytest.raises(ValueError):
+            # Expected Dimension with numeric size, got `1` instead
+            IndexSum(u, 1)
+        with pytest.raises(ValueError):
+            # Expected Dimension with numeric size, got `x` instead
+            IndexSum(u, x)
+        with pytest.raises(ValueError):
+            # Dimension `i` must appear in `expr`
+            IndexSum(u, i)
+
+    def test_stencil_dim_comparison(self):
+        i1 = StencilDimension('i', 0, 1)
+        i2 = StencilDimension('i', 0, 1)
+        i3 = StencilDimension('i', 0, 2)
+        assert i1 is i2  # Due to caching
+        assert i1 == i2  # Obv
+        assert i1 != i3
+
+    def test_index_sum_basic(self):
+        grid = Grid((10,))
+
+        x, = grid.dimensions
+        i = StencilDimension('i', 0, 1)
+
+        u = Function(name="u", grid=grid, space_order=2)
+
+        # Build `u(x + h_x)`
+        term0 = u.subs(x, x + x.spacing)
+
+        # `u(x + h_x)` -> `u(x + i*h_x)`
+        term = term0.subs(x + x.spacing, x + i*x.spacing)
+
+        # Sum `term` over `i`
+        idxsum = IndexSum(term, i)
+
+        # == u(x) + u(x + h_x)
+        assert idxsum.evaluate == u + term0
+
+    def test_index_sum_2d(self):
+        grid = Grid((10, 10))
+
+        x, y = grid.dimensions
+        i = StencilDimension('i', 0, 1)
+        j = StencilDimension('j', 0, 1)
+
+        u = Function(name="u", grid=grid, space_order=2)
+
+        # Build `u(x + h_x, y + y_h)`
+        term0 = u.xreplace({x: x + x.spacing, y: y + y.spacing})
+        term = term0.xreplace({x + x.spacing: x + i*x.spacing,
+                               y + y.spacing: y + j*y.spacing})
+
+        # Sum `term` over `i`
+        idxsum = IndexSum(term, (i, j))
+
+        # == u(x, y) + u(x, y + h_y) + u(x + h_x, y) + u(x + h_x, y + h_y)
+        assert idxsum.evaluate == (u +
+                                   u.subs(x, x + x.spacing) +
+                                   u.subs(y, y + y.spacing) +
+                                   term0)
+
+    def test_index_sum_free_symbols(self):
+        grid = Grid((10,))
+
+        x, = grid.dimensions
+        i = StencilDimension('i', 0, 1)
+
+        u = Function(name="u", grid=grid)
+
+        idxsum = IndexSum(u.subs(x, x*i), i)
+
+        assert idxsum.free_symbols == {x}
+
+    def test_index_sum_nested(self):
+        grid = Grid((10, 10))
+
+        x, y = grid.dimensions
+        i = StencilDimension('i', 0, 1)
+        j = StencilDimension('j', 0, 1)
+
+        u = Function(name="u", grid=grid, space_order=2)
+
+        term0 = u.xreplace({x: x + x.spacing, y: y + y.spacing})
+        term = term0.xreplace({x + x.spacing: x + i*x.spacing,
+                               y + y.spacing: y + j*y.spacing})
+
+        idxsum = IndexSum(IndexSum(term, j), i)
+
+        # Expect same output as `test_index_sum_2d`
+        assert idxsum.evaluate == (u +
+                                   u.subs(x, x + x.spacing) +
+                                   u.subs(y, y + y.spacing) +
+                                   term0)
+
+    def test_dot_like(self):
+        grid = Grid((10, 10))
+
+        x, y = grid.dimensions
+        i = StencilDimension('i', 0, 1)
+
+        u = Function(name="u", grid=grid, space_order=2)
+        v = Function(name="v", grid=grid, space_order=2)
+
+        ui = u.subs(x, x + i*x.spacing)
+        vi = v.subs(y, y + i*y.spacing)
+
+        # Sum `term` over `i`
+        idxsum = IndexSum(ui*vi, i)
+
+        assert idxsum.evaluate == u*v + u.subs(x, x + x.spacing)*v.subs(y, y + y.spacing)
+
+    def test_index_derivative(self):
+        grid = Grid((10,))
+        x, = grid.dimensions
+
+        so = 2
+        i = StencilDimension('i', 0, 2)
+
+        u = Function(name="u", grid=grid, space_order=so)
+
+        ui = u.subs(x, x + i*x.spacing)
+        w = Weights(name='w0', dimensions=i, initvalue=[-0.5, 0, 0.5])
+
+        idxder = IndexDerivative(ui*w, {x: i})
+
+        assert simplify(idxder.evaluate - (-0.5*u + 0.5*ui.subs(i, 2))) == 0
+        assert idxder.properties == frozenset()
+
+        # Lowering properties are part of the IndexDerivative identity and
+        # survive reconstruction
+        fold = IndexDerivativeProperty('fold')
+        unroll = IndexDerivativeProperty('unroll')
+        idxder1 = idxder._rebuild(properties=(fold, unroll))
+        assert idxder1.properties == frozenset([fold, unroll])
+        assert idxder1 != idxder
+        assert len({idxder, idxder1}) == 2
+        assert idxder1._rebuild() == idxder1
+        assert idxder1.compare(idxder) != 0
+
+        with pytest.raises(ValueError, match="Expected IndexDerivative properties"):
+            idxder._rebuild(properties=('fold', 'unroll'))
+
+        # Make sure subs works as expected
+        v = Function(name="v", grid=grid, space_order=so)
+
+        vi0 = v.subs(x, x + i*x.spacing)
+        vi1 = idxder1.subs(ui, vi0)
+
+        assert IndexDerivative(vi0*w, {x: i},
+                               properties=idxder1.properties) == vi1
+
+    def test_dx2(self):
+        grid = Grid(shape=(4, 4))
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        term0 = f.dx2.evaluate
+        assert isinstance(term0, EvalDerivative)
+
+        term1 = f.dx2._evaluate(expand=False)
+        print(type(term1))
+        assert isinstance(term1, DiffDerivative)
+        assert term1.depth == 1
+        term1 = term1.evaluate
+
+        assert isinstance(term1, EvalDerivative)  # devito.fd.Add
+
+        # Check that the first partially evaluated then fully evaluated
+        # `term1` matches up the fully evaluated `term0`
+        assert EvalDerivative(*term0.args) == term1
+
+    def test_dx45(self):
+        grid = Grid(shape=(4, 4))
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        term0 = f.dx45.evaluate
+        assert len(term0.args) == 2
+
+        term1 = f.dx45._evaluate(expand=False)
+        assert len(term1.args) == 2
+        for i in range(2):
+            assert isinstance(term0.args[i], EvalDerivative)
+            assert isinstance(term1.args[i], DiffDerivative)
+            assert term1.args[i].depth == 1
+
+        term1 = term1.evaluate
+        assert isinstance(term1, Add)  # devito.fd.EvalDerivative
+
+        # Check that the first partially evaluated then fully evaluated
+        # `term1` matches up the fully evaluated `term0`
+        assert Add(*term0.args) == term1
+
+    def test_dxdy(self):
+        grid = Grid(shape=(4, 4))
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        term0 = f.dx.dy.evaluate
+        assert isinstance(term0, EvalDerivative)
+
+        term1 = f.dx.dy._evaluate(expand=False)
+        assert isinstance(term1, DiffDerivative)
+        assert term1.depth == 2
+        term1 = term1.evaluate
+        assert isinstance(term1, EvalDerivative)  # devito.fd.Add
+
+        # Through expansion and casting we also check that `term0`
+        # is indeed mathematically equivalent to `term1`
+        assert EvalDerivative(*term0.expand().args) == term1.expand()
+
+    def test_dxdy_v2(self):
+        grid = Grid(shape=(4, 4))
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        term1 = f.dxdy._evaluate(expand=False)
+        assert len(term1.find(DiffDerivative)) == 2
+
+    def test_transpose(self):
+        grid = Grid(shape=(4, 4))
+        x, _ = grid.dimensions
+        h_x = x.spacing
+
+        f = TimeFunction(name='f', grid=grid, space_order=4)
+
+        term = f.dx.T._evaluate(expand=False)
+        assert isinstance(term, DiffDerivative)
+
+        i0, = term.dimensions
+        assert term.base == f.subs(x, x + i0*h_x)
+
+    def test_tensor_algebra(self):
+        grid = Grid(shape=(4, 4))
+
+        f = Function(name='f', grid=grid, space_order=4)
+
+        v = grad(f)._evaluate(expand=False)
+
+        assert all(isinstance(i, IndexDerivative) for i in v)
+        assert all(zip([Add(*i.args) for i in grad(f).evaluate], v.evaluate, strict=True))
+
+    def test_laplacian_opt(self):
+        grid = Grid(shape=(4, 4))
+        f = Function(name='f', grid=grid, space_order=4)
+
+        assert f.laplacian() == f.laplace
+        df = f.laplacian(order=2, shift=.5)
+        for (v, d) in zip(df.args, grid.dimensions, strict=True):
+            assert v.dims[0] == d
+            assert v.fd_order == (2,)
+            assert v.deriv_order == (2,)
+            assert d in v.x0
+
+
+def bypass_uneval(expr):
+    unevals = expr.find(EvalDerivative)
+    mapper = {i: Add(*i.args) for i in unevals}
+    return expr.xreplace(mapper)
+
+
+class TestExpansion:
+    @classmethod
+    def setup_class(cls):
+        cls.grid = Grid(shape=(11,), extent=(1,))
+        cls.x = cls.grid.dimensions[0]
+        cls.u = TimeFunction(name='u', grid=cls.grid, space_order=4)
+        cls.t = cls.u.time_dim
+
+        cls.v = Function(name='v', grid=cls.grid, space_order=4)
+        cls.w = Function(name='w', grid=cls.grid, space_order=4)
+        cls.f = Function(name='f', dimensions=(cls.t,), shape=(5,))
+
+        # Note that using the `.dx` shortcut method specifies the fd_order kwarg
+        a = cls.u.dx
+        cls.b = a.subs({cls.u: -5*cls.u.dx + 4*cls.u + 3}, postprocess=False)
+
+    def test_reconstructible(self):
+        """
+        Check that devito.Derivatives are reconstructible from func and args
+        (as per sympy docs)
+        """
+        du = self.u.dx
+        assert du.func(*du.args) == du
+        assert du.func(*du.args).args == (self.u, (self.x, 1))
+
+    def test_deriv_order(self):
+        """
+        Check default simplification causes the same result
+        """
+        du11 = Derivative(self.u, self.x, self.x)
+        du2 = Derivative(self.u, (self.x, 2))
+        assert du11 == du2
+        assert du11.deriv_order == du2.deriv_order
+
+    def test_wrong_deriv_order(self):
+        """
+        Check an exception is raises with incompatible arguments
+        """
+        with pytest.raises(ValueError):
+            _ = Derivative(self.u, self.x, deriv_order=(2, 4))
+
+    def test_no_derivative(self):
+        with pytest.raises(ValueError):
+            _ = Derivative(sympify(-1))
+
+    def test_no_dimension(self):
+        with pytest.raises(ValueError):
+            _ = Derivative(sympify(-1), deriv_order=0)
+
+    def test_constant(self):
+        """
+        Check constant derivative is zero for non-0th order derivatives
+        """
+        assert Derivative(sympify(-1), (self.x, 1)) == 0
+        assert Derivative(sympify(-1), (self.x, 2)) == 0
+        assert Derivative(sympify(-1), (self.x, 0)) == -1
+
+    def test_dims_validation(self):
+        """
+        Validate `dims` kwarg
+        """
+        grid = Grid(shape=(11, 11, 11), extent=(1, 1, 1))
+        x, y, z = grid.dimensions
+        u = Function(name='u', grid=grid, space_order=4)
+
+        d = Derivative(u, x)
+        assert d.dims == (x,)
+        assert d.deriv_order == (1,)
+
+        d = Derivative(u, x, y)
+        assert d.dims == (x, y)
+        assert d.deriv_order == (1, 1)
+
+        d = Derivative(u, (x, 2))
+        assert d.dims == (x, )
+        assert d.deriv_order == (2, )
+
+        d = Derivative(u, (x, 2), (y, 2))
+        assert d.dims == (x, y)
+        assert d.deriv_order == (2, 2)
+
+        d = Derivative(u, (x, 2), y, x, (z, 3))
+        assert d.dims == (x, y, z)
+        assert d.deriv_order == (3, 1, 3)
+
+    def test_dims_exceptions(self):
+        """
+        Check invalid dimensions and orders raise exceptions
+        """
+        grid = Grid(shape=(11, 11, 11), extent=(1, 1, 1))
+        x, y, z = grid.dimensions
+        u = Function(name='u', grid=grid, space_order=4)
+
+        # Don't allow negative derivatives
+        with pytest.raises(TypeError):
+            _ = Derivative(u, (x, -1))
+
+        # Don't allow fractional derivatives
+        with pytest.raises(TypeError):
+            _ = Derivative(u, (x, 0.5))
+
+        # Don't allow common mistake
+        # NB: Derivative(u, x, y) is probably what was intended
+        with pytest.raises(TypeError):
+            _ = Derivative(u, (x, y))
+
+        # Don't allow derivative order to be symbolic
+        a = Symbol('a', integer=True)
+        with pytest.raises(TypeError):
+            _ = Derivative(u, (x, a))
+
+    def test_expand_mul(self):
+        """
+        Check independent terms can be extracted from the derivative.
+        The multiply expansion is the only hint executed by default when
+        `.expand()` is called.
+        """
+        expanded = Derivative(4*self.u - 5*Derivative(self.u, self.x) + 3, self.x)
+        assert self.b.expand() == expanded
+
+        expr = self.u.dx.subs({self.u: 5*self.f*self.u*self.v*self.w})
+        expanded = 5*self.f*Derivative(self.u*self.v*self.w, self.x)
+        assert diffify(expr.expand()) == expanded
+
+    def test_expand_add(self):
+        """
+        Check linearity
+        """
+        expanded = 4*Derivative(self.u, self.x)
+        expanded -= 5*Derivative(Derivative(self.u, self.x), self.x)
+        assert self.b.expand(add=True) == expanded
+
+    def test_expand_nest(self):
+        """
+        Check valid nested derivative expands (combining x derivatives)
+        Note that it is important to specify `fd_order` to avoid raising a warning
+        """
+        a = self.u.dx(fd_order=2)
+        b = a.subs({self.u: -5*self.u.dx(fd_order=2) + 4*self.u + 3}, postprocess=False)
+        expanded = 4*Derivative(self.u, self.x, fd_order=2) \
+            - 5*Derivative(self.u, (self.x, 2), fd_order=4)
+        assert b.expand(add=True, nest=True) == expanded
+
+        # Check that doing the naïve thing raises a warning, but asserts equal
+        expanded = 4*Derivative(self.u, self.x) - 5*Derivative(self.u, (self.x, 2))
+        with pytest.warns(DevitoWarning):
+            assert self.b.expand(add=True, nest=True) == expanded
+
+    def test_nested_orders(self):
+        """
+        Check nested expansion results in correct derivative and fd order
+        """
+        # Default fd_order
+        du22 = Derivative(Derivative(self.u, (self.x, 2)), (self.x, 2))
+        with pytest.warns(DevitoWarning):
+            du22_expanded = du22.expand(nest=True)
+        du4 = Derivative(self.u, (self.x, 4))
+        assert du22_expanded == du4
+        assert du22_expanded.deriv_order == du4.deriv_order
+        assert du22_expanded.fd_order == du4.fd_order
+
+        # Specified fd_order
+        du22 = Derivative(
+            Derivative(self.u, (self.x, 2), fd_order=2),
+            (self.x, 2),
+            fd_order=2
+        )
+        du22_expanded = du22.expand(nest=True)
+        du4 = Derivative(self.u, (self.x, 4), fd_order=4)
+        assert du22_expanded == du4
+        assert du22_expanded.deriv_order == du4.deriv_order
+        assert du22_expanded.fd_order == du4.fd_order
+
+        # Specified fd_order greater than the space order
+        # > When no order specified
+        du44 = Derivative(Derivative(self.u, (self.x, 4)), (self.x, 4))
+        with pytest.raises(ValueError):
+            _ = du44.expand(nest=True)
+
+        # > When order specified is too large
+        du44 = Derivative(
+            Derivative(self.u, (self.x, 4), fd_order=4),
+            (self.x, 4),
+            fd_order=4
+        )
+        with pytest.raises(ValueError):
+            _ = du44.expand(nest=True)
+
+    def test_expand_product_rule(self):
+        """
+        Check the two implemented cases for product rule expansion
+        """
+        expr = self.u.dx.subs({self.u: 5*self.f*self.u*self.v*self.w}, postprocess=False)
+        expanded = 5*self.f*self.v*self.w*Derivative(self.u, self.x) \
+            + 5*self.f*self.v*self.u*Derivative(self.w, self.x) \
+            + 5*self.f*self.w*self.u*Derivative(self.v, self.x)
+        assert diffify(expr.expand(product_rule=True)) == expanded
+
+        expr = self.u.dx2.subs({self.u: 5*self.f*self.u*self.v}, postprocess=False)
+        expanded = 5*self.f*self.v*Derivative(self.u, (self.x, 2)) \
+            + 10*self.f*Derivative(self.v, self.x)*Derivative(self.u, self.x) \
+            + 5*self.f*self.u*Derivative(self.v, (self.x, 2))
+        assert diffify(expr.expand(product_rule=True)) == expanded
+
+    def test_fallback_wrong_custom_size(self):
+        """
+        Check an exception is raised when a custom size is not compatible
+        with the derivative order
+        """
+        grid = Grid((10,))
+        x, = grid.dimensions
+        u = Function(name="u", grid=grid, space_order=2, staggered=x)
+        v = Function(name="v", grid=grid, space_order=2, staggered=NODE)
+
+        w = [-2, 2]  # Should 2 coeff since this is staggered
+
+        eq0 = Eq(u, v.dx(w=w)).evaluate
+        exp0 = -2 * v / x.spacing + 2 * v._subs(x, x + x.spacing)/x.spacing
+        # This one should fallback to taylor coeffs since w is too short
+        # for a centered derivative
+        eq1 = Eq(v, v.dx(w=w)).evaluate
+        exp1 = - .5 * (v._subs(x, x - x.spacing) - v._subs(x, x + x.spacing))/x.spacing
+        assert simplify(eq0.rhs - exp0) == 0
+        assert simplify(eq1.rhs - exp1) == 0
+
+
+class TestDimension:
+    """
+    Check the few cases where differentiating a dimension is allowed work correctly
+    and errors are raised otherwise.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        cls.grid = Grid(shape=(11, 11), extent=(1, 1))
+        cls.x, cls.y = cls.grid.dimensions
+        u = TimeFunction(name='u', grid=cls.grid, space_order=1)
+        cls.t = u.time_dim
+
+    def test_constant(self):
+        assert Derivative(self.x, self.x) == 1
+
+    def test_null(self):
+        assert Derivative(self.x, (self.x, 2)) == 0
+        assert Derivative(self.x, self.x, self.y) == 0
+        assert Derivative(self.x, self.x, self.y) == 0
+        assert Derivative(self.x, self.x, self.y, self.t) == 0
+        assert Derivative(self.x, self.y, self.t, self.x) == 0
+        assert Derivative(self.x, self.y, self.t, (self.x, 2)) == 0
+
+    def test_unevaluated(self):
+        """
+        The following should all be instantiatible without raising an
+        exception, but should not simplify.
+        """
+        assert Derivative(self.x, self.t)
+        assert Derivative(self.x, self.y, self.t)
+        assert Derivative(self.x, (self.x, 0))
+
+
+@pytest.mark.parametrize('expand', [True, False])
+@pytest.mark.parametrize('deriv_order', [0, 1, 2])
+def test_deriv_sum_mixed_staggering(expand, deriv_order):
+    """
+    A shifted derivative is linear: `D(a + b) == D(a) + D(b)`, at every order.
+
+    Broke for terms at different staggered locations, `Add` reporting only its
+    first argument's.
+    """
+    so = 8
+    grid = Grid(shape=(41, 41), extent=(40., 40.))
+    x, y = grid.dimensions
+
+    vx = Function(name='vx', grid=grid, space_order=so, staggered=x)
+    vy = Function(name='vy', grid=grid, space_order=so, staggered=y)
+    out = Function(name='out', grid=grid, space_order=so, staggered=(x, y))
+
+    rng = np.random.default_rng(3)
+    for f in (vx, vy):
+        f.data[:] = rng.normal(size=f.shape)
+
+    def shifted(expr):
+        return expr.diff(y, deriv_order=deriv_order, fd_order=2,
+                         x0={y: y + y.spacing/2})
+
+    def run(expr):
+        out.data[:] = 0.
+        Operator(Eq(out, expr), opt=('advanced', {'expand': expand})).apply()
+        return np.array(out.data)
+
+    s = slice(so + 3, -(so + 3))
+    together = run(shifted(vx.dy + vy.dx))[s, s]
+    apart = (run(shifted(vx.dy)) + run(shifted(vy.dx)))[s, s]
+
+    assert np.linalg.norm(apart) > 0
+    # float32 reassociation only: the two forms sum the same terms in a
+    # different order
+    assert np.linalg.norm(together - apart) / np.linalg.norm(apart) < 1e-5
+
+
+class Region(SubDomain):
+    """SubDomain given by its `define` mapping for each Dimension name."""
+
+    def __init__(self, name, regions, **kwargs):
+        self.name = name
+        self.regions = regions
+        super().__init__(**kwargs)
+
+    def define(self, dimensions):
+        return {d: self.regions.get(d.name, d) for d in dimensions}
+
+
+@pytest.mark.parametrize('expand', [True, False])
+@pytest.mark.parametrize('op', ['add', 'mul'])
+def test_deriv_mixed_subdomain_functions(op, expand):
+    """
+    A derivative shifts every Function of the expression, including those
+    defined on a SubDomain, whose Dimension (`ix`) differs from the Grid's (`x`).
+
+    Used to leave `p(ix)` unshifted, so `(f + p).dx` dropped `p` altogether.
+    """
+    so = 4
+    grid = Grid(shape=(24,), extent=(23.,))
+    strip = Region('strip', {'x': ('left', 8)}, grid=grid)
+
+    f = Function(name='f', grid=grid, space_order=so)
+    p = Function(name='p', grid=strip, space_order=so)
+    # Reference: `p` extended by zero on the whole Grid
+    p_full = Function(name='p_full', grid=grid, space_order=so)
+    out = Function(name='out', grid=grid, space_order=so)
+    ref = Function(name='ref', grid=grid, space_order=so)
+
+    rng = np.random.default_rng(0)
+    f.data[:] = rng.normal(size=f.shape)
+    p.data[:] = rng.normal(size=p.shape)
+    p_full.data[:8] = p.data
+
+    combine = {'add': lambda u, v: u + v, 'mul': lambda u, v: u * v}[op]
+    Operator([Eq(out, combine(f, p).dx, subdomain=strip),
+              Eq(ref, combine(f, p_full).dx, subdomain=strip)],
+             opt=('advanced', {'expand': expand})).apply()
+
+    assert np.linalg.norm(ref.data) > 0
+    assert np.allclose(out.data, ref.data, rtol=1e-6, atol=1e-6)
+
+
+def test_deriv_mixed_subdomain_cpml_adjoint():
+    """
+    Dot test of a one-face CPML derivative whose memory variable lives on the
+    CPML layer only.
+
+        forward: out = D q + psi[n+1]  (psi on the layer)
+                 psi[n+1] = b psi[n] + a D q
+        adjoint: q_bar = D^T (out_bar + a (psi_bar + out_bar))
+
+    The adjoint CPML term mixes Grid and SubDomain Functions inside `.dx.T`, and
+    is nonzero on the layer grown by the stencil radius. `a` vanishes outside
+    the layer, so no zero-padded work field is needed.
+    """
+    nx, width, so, nt = 32, 6, 8, 8
+    grid = Grid(shape=(nx,), extent=(float(nx - 1),), dtype=np.float64)
+    time = grid.time_dim
+    x = grid.dimensions[0]
+    cpml = Region('cpml', {'x': ('left', width)}, grid=grid)
+    cpml_r = Region('cpml_r', {'x': ('left', width + so // 2)}, grid=grid)
+
+    kwargs = {'grid': grid, 'save': nt, 'space_order': so, 'dtype': np.float64}
+    q = TimeFunction(name='q', **kwargs)
+    out = TimeFunction(name='out', **kwargs)
+    q_bar = TimeFunction(name='q_bar', **kwargs)
+    out_bar = TimeFunction(name='out_bar', **kwargs)
+    psi = TimeFunction(name='psi', grid=cpml, time_order=1, space_order=0,
+                       dtype=np.float64)
+    # The adjoint loop over `cpml_r` reads `psi_bar` one more radius away
+    psi_bar = TimeFunction(name='psi_bar', grid=cpml, time_order=1,
+                           space_order=(so, so, so), dtype=np.float64)
+    a = Function(name='a', grid=grid, dimensions=(x,), shape=(nx,), space_order=so,
+                 dtype=np.float64)
+    b = Function(name='b', grid=grid, dimensions=(x,), shape=(nx,), dtype=np.float64)
+    a.data[:width] = -0.1
+    b.data[:width] = 0.8
+
+    forward = Operator([Eq(out, q.dx),
+                        Eq(psi.forward, b * psi + a * q.dx, subdomain=cpml),
+                        Eq(out, out + psi.forward, subdomain=cpml)])
+    value = psi_bar + out_bar
+    adjoint = Operator([
+        Eq(psi_bar.backward, b * value, subdomain=cpml, implicit_dims=(time,)),
+        Eq(q_bar, out_bar.dx.T, implicit_dims=(time,)),
+        Inc(q_bar, (a * value).dx.T, subdomain=cpml_r, implicit_dims=(time,))
+    ])
+
+    rng = np.random.default_rng(7)
+    q.data[:] = rng.normal(size=q.shape)
+    out_bar.data[:] = rng.normal(size=out_bar.shape)
+    forward.apply(time_m=0, time_M=nt - 1)
+    adjoint.apply(time_m=0, time_M=nt - 1)
+
+    lhs = np.vdot(out.data, out_bar.data)
+    rhs = np.vdot(q.data, q_bar.data)
+    assert np.isclose(lhs, rhs, rtol=1e-12)
+
+
+class TestHaloZero:
+    """
+    Derivatives with `halo=0` treat their argument as zero outside the SubDomain
+    of their equation. With `.T`, `Inc(g_bar, out_bar.dx(halo=0).T, subdomain=S)`
+    is the adjoint of `Eq(out, g.dx, subdomain=S)`.
+    """
+
+    @staticmethod
+    def dot_test(grid, subdomain, deriv, so, eq_type=Inc, opt='advanced'):
+        """
+        Relative error of the dot test between `Eq(out, g.<deriv>, subdomain=S)`
+        and `eq_type(g_bar, out_bar.<deriv>(halo=0).T, subdomain=S)`, both built
+        with the optimization options `opt`.
+        """
+        kwargs = {'grid': grid, 'space_order': so, 'dtype': np.float64}
+        g = Function(name='g', **kwargs)
+        out = Function(name='out', **kwargs)
+        out_bar = Function(name='out_bar', **kwargs)
+        g_bar = Function(name='g_bar', **kwargs)
+
+        rng = np.random.default_rng(1)
+        g.data[:] = rng.normal(size=g.shape)
+        # Nonzero outside S too: the adjoint must ignore it there
+        out_bar.data[:] = rng.normal(size=out_bar.shape)
+
+        Operator(Eq(out, getattr(g, deriv), subdomain=subdomain), opt=opt).apply()
+        adjoint = getattr(out_bar, deriv)(halo=0).T
+        Operator(eq_type(g_bar, adjoint, subdomain=subdomain), opt=opt).apply()
+
+        lhs = np.vdot(out.data, out_bar.data)
+        rhs = np.vdot(g.data, g_bar.data)
+        return abs(lhs - rhs) / abs(lhs)
+
+    @pytest.mark.parametrize('so', [2, 4, 8])
+    @pytest.mark.parametrize('deriv', ['dx', 'dx2'])
+    @pytest.mark.parametrize('region', [('left', 6), ('right', 5), ('middle', 7, 9)])
+    def test_adjoint(self, region, deriv, so):
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': region}, grid=grid)
+
+        assert self.dot_test(grid, subdomain, deriv, so) < 1e-12
+
+    def test_adjoint_eq(self):
+        """An assignment covers the whole grown region, like an increment."""
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+
+        assert self.dot_test(grid, subdomain, 'dx', 4, eq_type=Eq) < 1e-12
+
+    @pytest.mark.parametrize('deriv', ['dx', 'dx2'])
+    def test_adjoint_unexpanded(self, deriv):
+        """The stencil stays a loop over its points: the mask is read within it."""
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        opt = ('advanced', {'expand': False})
+
+        assert self.dot_test(grid, subdomain, deriv, 8, opt=opt) < 1e-12
+
+        out_bar = Function(name='out_bar', grid=grid, space_order=8)
+        g_bar = Function(name='g_bar', grid=grid, space_order=8)
+        op = Operator(Inc(g_bar, out_bar.dx(halo=0).T, subdomain=subdomain), opt=opt)
+        assert 'for (int i0' in str(op.ccode)
+
+    @pytest.mark.parametrize('so', [2, 4, 8])
+    @pytest.mark.parametrize('stagger_in, stagger_out', [(True, False), (False, True)])
+    def test_adjoint_staggered(self, stagger_in, stagger_out, so):
+        """
+        Staggered first derivatives, as in elastic CPMLs: with `g` and `out`
+        staggered apart, the adjoint of `Eq(out, g.dx, subdomain=S)` is
+        `-out_bar.dx(halo=0)` evaluated at the location of `g`.
+        """
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        x = grid.dimensions[0]
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': so, 'dtype': np.float64}
+        g = Function(name='g', staggered=x if stagger_in else None, **kwargs)
+        g_bar = Function(name='g_bar', staggered=x if stagger_in else None, **kwargs)
+        out = Function(name='out', staggered=x if stagger_out else None, **kwargs)
+        out_bar = Function(name='out_bar', staggered=x if stagger_out else None,
+                           **kwargs)
+
+        rng = np.random.default_rng(5)
+        g.data[:] = rng.normal(size=g.shape)
+        out_bar.data[:] = rng.normal(size=out_bar.shape)
+
+        Operator(Eq(out, g.dx, subdomain=subdomain)).apply()
+        Operator(Inc(g_bar, -out_bar.dx(halo=0), subdomain=subdomain)).apply()
+
+        lhs = np.vdot(out.data, out_bar.data)
+        rhs = np.vdot(g.data, g_bar.data)
+        assert np.isclose(lhs, rhs, rtol=1e-12)
+
+    def test_adjoint_unexpanded_3d(self):
+        """
+        In unexpanded form, the indicators vary along the stencil: they must not
+        be hoisted as invariants of the outer Dimensions, as on GPUs.
+        """
+        grid = Grid(shape=(12, 21, 12), extent=(1., 1., 1.), dtype=np.float64)
+        subdomain = Region('s', {'y': ('right', 6)}, grid=grid)
+        opt = ('advanced', {'expand': False})
+
+        assert self.dot_test(grid, subdomain, 'dy', 8, opt=opt) < 1e-12
+
+    @pytest.mark.parametrize('deriv', ['dx', 'dy'])
+    def test_adjoint_2d(self, deriv):
+        grid = Grid(shape=(20, 22), extent=(19., 21.), dtype=np.float64)
+        subdomain = Region('s', {'x': ('left', 6), 'y': ('middle', 4, 5)}, grid=grid)
+
+        assert self.dot_test(grid, subdomain, deriv, 4) < 1e-12
+
+    def test_forward(self):
+        """`g.dx(halo=0)` is the derivative of `g` extended by zero outside S."""
+        so = 4
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': so, 'dtype': np.float64}
+        g = Function(name='g', **kwargs)
+        g_zero = Function(name='g_zero', **kwargs)
+        out = Function(name='out', **kwargs)
+        ref = Function(name='ref', **kwargs)
+
+        g.data[:] = np.random.default_rng(2).normal(size=g.shape)
+        g_zero.data[7:-9] = g.data[7:-9]
+
+        Operator([Eq(out, g.dx(halo=0), subdomain=subdomain),
+                  Eq(ref, g_zero.dx)]).apply()
+
+        assert np.linalg.norm(ref.data) > 0
+        assert np.allclose(out.data, ref.data, rtol=1e-12, atol=1e-12)
+
+    def test_default_unchanged(self):
+        """
+        Without `halo=0`, `.T` in a SubDomain equation is the full-grid transpose
+        evaluated on S only.
+        """
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        g_bar = Function(name='g_bar', **kwargs)
+        ref = Function(name='ref', **kwargs)
+        out_bar = Function(name='out_bar', **kwargs)
+        out_bar.data[:] = np.random.default_rng(3).normal(size=out_bar.shape)
+
+        Operator([Inc(g_bar, out_bar.dx.T, subdomain=subdomain),
+                  Inc(ref, out_bar.dx.T)]).apply()
+
+        assert np.allclose(g_bar.data[7:-9], ref.data[7:-9], rtol=1e-12)
+        assert np.all(g_bar.data[:7] == 0) and np.all(g_bar.data[-9:] == 0)
+
+    def test_same_subdomain_two_grids(self):
+        """Equal SubDomains on different Grids get their own masks."""
+        for shape in [(24,), (24,)]:
+            grid = Grid(shape=shape, extent=(23.,), dtype=np.float64)
+            subdomain = Region('s', {'x': ('left', 6)}, grid=grid)
+
+            assert self.dot_test(grid, subdomain, 'dx', 4) < 1e-12
+
+    def test_transpose_keeps_halo(self):
+        grid = Grid(shape=(8,))
+        f = Function(name='f', grid=grid, space_order=4)
+
+        assert f.dx(halo=0).halo == 0
+        assert f.dx(halo=0).T.halo == 0
+        assert f.dx.T.halo is None
+        assert f.dx(halo=0) != f.dx
+
+    def test_no_subdomain(self):
+        """Without a SubDomain, halo=0 has no effect."""
+        grid = Grid(shape=(16,), extent=(15.,), dtype=np.float64)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        f = Function(name='f', **kwargs)
+        g = Function(name='g', **kwargs)
+        ref = Function(name='ref', **kwargs)
+        f.data[:] = np.random.default_rng(4).normal(size=f.shape)
+
+        Operator([Eq(g, f.dx(halo=0).T), Eq(ref, f.dx.T)]).apply()
+
+        assert np.all(g.data == ref.data)
+
+    @pytest.mark.parametrize('region, grown', [
+        (('left', 6), ('left', 8)),
+        (('right', 5), ('right', 7)),
+        (('middle', 7, 9), ('middle', 5, 7)),
+        (('middle', 1, 9), ('middle', 0, 7)),
+        (('left', 15), ('left', 16)),
+    ])
+    def test_derived_subdomain(self, region, grown):
+        """
+        A DerivedSubDomain spans its parent grown by `growth`, within the Grid.
+        """
+        grid = Grid(shape=(16,))
+        x = grid.dimensions[0]
+        subdomain = Region('s', {'x': region}, grid=grid)
+
+        grown_subdomain = subdomain._grow({x: 2})
+
+        assert isinstance(grown_subdomain, DerivedSubDomain)
+        assert grown_subdomain.parent is subdomain
+        assert grown_subdomain.define(grid.dimensions) == {x: grown}
+
+    def test_terms(self):
+        """
+        In a sum, the terms without halo=0 derivatives stay on the SubDomain,
+        while the others extend past it. A factor of a halo=0 derivative is not
+        restricted.
+        """
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        f, g, c, out, ref = (Function(name=n, **kwargs)
+                             for n in ('f', 'g', 'c', 'out', 'ref'))
+        rng = np.random.default_rng(8)
+        for h in (f, g, c):
+            h.data[:] = rng.normal(size=h.shape)
+
+        Operator(Eq(out, f + c*g.dx(halo=0), subdomain=subdomain)).apply()
+        Operator([Eq(ref, f, subdomain=subdomain),
+                  Inc(ref, c*g.dx(halo=0), subdomain=subdomain)]).apply()
+
+        assert np.linalg.norm(ref.data[:7]) > 0
+        assert np.allclose(out.data, ref.data, rtol=1e-12, atol=1e-12)
+
+    def test_sum_factor(self):
+        """
+        A sum without halo=0 derivatives, as a factor of one, is not restricted:
+        the product extends past the SubDomain.
+        """
+        grid = Grid(shape=(24,), extent=(23.,), dtype=np.float64)
+        subdomain = Region('s', {'x': ('middle', 7, 9)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        f, g, c, d, out = (Function(name=n, **kwargs)
+                           for n in ('f', 'g', 'c', 'd', 'out'))
+        rng = np.random.default_rng(9)
+        for h in (f, g, c):
+            h.data[:] = rng.normal(size=h.shape)
+
+        Operator(Eq(d, g.dx(halo=0), subdomain=subdomain)).apply()
+        Operator(Eq(out, (f + c)*g.dx(halo=0), subdomain=subdomain)).apply()
+
+        expected = (f.data + c.data)*d.data
+        assert np.linalg.norm(expected[:7]) > 0
+        assert np.allclose(out.data, expected, rtol=1e-12, atol=1e-12)
+
+    def test_vector(self):
+        """
+        In a vector equation, each component is restricted and extended past the
+        SubDomain as in the corresponding scalar equation.
+        """
+        grid = Grid(shape=(12, 14), extent=(11., 13.), dtype=np.float64)
+        subdomain = Region('s', {'x': ('left', 5)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        f = Function(name='f', **kwargs)
+        c = VectorFunction(name='c', staggered=(None, None), **kwargs)
+        w = VectorFunction(name='w', staggered=(None, None), **kwargs)
+        ref = [Function(name=f'ref{i}', **kwargs) for i in range(2)]
+        rng = np.random.default_rng(10)
+        for h in (f, *c):
+            h.data[:] = rng.normal(size=h.shape)
+
+        Operator(Eq(w, c*f.dx(halo=0), subdomain=subdomain)).apply()
+        Operator([Eq(r, ci*f.dx(halo=0), subdomain=subdomain)
+                  for r, ci in zip(ref, c, strict=True)]).apply()
+
+        for wi, r in zip(w, ref, strict=True):
+            assert np.linalg.norm(r.data[5:]) > 0
+            assert np.allclose(wi.data, r.data, rtol=1e-12, atol=1e-12)
+
+    def test_vector_staggered(self):
+        """
+        Dot test of a staggered vector equation restricted to a SubDomain, as in
+        elastic CPMLs: the adjoint of `Eq(v, grad(p), subdomain=S)`, with `v`
+        staggered, is `Inc(p_bar, -div(v_bar))` with halo=0 derivatives.
+        """
+        grid = Grid(shape=(14, 16), extent=(13., 15.), dtype=np.float64)
+        x, y = grid.dimensions
+        subdomain = Region('s', {'x': ('left', 5), 'y': ('middle', 4, 5)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        p = Function(name='p', **kwargs)
+        p_bar = Function(name='p_bar', **kwargs)
+        v = VectorFunction(name='v', **kwargs)
+        v_bar = VectorFunction(name='v_bar', **kwargs)
+        rng = np.random.default_rng(11)
+        p.data[:] = rng.normal(size=p.shape)
+        for vi in v_bar:
+            vi.data[:] = rng.normal(size=vi.shape)
+
+        Operator(Eq(v, grad(p), subdomain=subdomain)).apply()
+        Operator(Inc(p_bar, -(v_bar[0].dx(halo=0) + v_bar[1].dy(halo=0)),
+                     subdomain=subdomain)).apply()
+
+        lhs = sum(np.vdot(vi.data, vi_bar.data)
+                  for vi, vi_bar in zip(v, v_bar, strict=True))
+        rhs = np.vdot(p.data, p_bar.data)
+        assert np.isclose(lhs, rhs, rtol=1e-12)
+
+    def test_unrestricted_dimension(self):
+        """halo=0 along a Dimension the SubDomain spans has no effect."""
+        grid = Grid(shape=(12, 14), extent=(11., 13.), dtype=np.float64)
+        subdomain = Region('s', {'x': ('left', 5)}, grid=grid)
+        kwargs = {'grid': grid, 'space_order': 4, 'dtype': np.float64}
+        f = Function(name='f', **kwargs)
+        g = Function(name='g', **kwargs)
+        ref = Function(name='ref', **kwargs)
+        f.data[:] = np.random.default_rng(6).normal(size=f.shape)
+
+        Operator([Eq(g, f.dy(halo=0), subdomain=subdomain),
+                  Eq(ref, f.dy, subdomain=subdomain)]).apply()
+
+        assert np.all(g.data == ref.data)
+
+    def test_invalid_halo(self):
+        grid = Grid(shape=(8,))
+        f = Function(name='f', grid=grid, space_order=4)
+
+        with pytest.raises(ValueError):
+            f.dx(halo=1)
+
+    def test_nested_halo(self):
+        """Differentiating a derivative with `halo=0` is not supported."""
+        grid = Grid(shape=(24,))
+        subdomain = Region('s', {'x': ('left', 6)}, grid=grid)
+        f = Function(name='f', grid=grid, space_order=4)
+        g = Function(name='g', grid=grid, space_order=4)
+
+        with pytest.raises(NotImplementedError):
+            _ = Eq(g, f.dx(halo=0).dx(halo=0), subdomain=subdomain).evaluate
+
+    def test_growth(self):
+        """
+        The growth of an evaluated expression is the largest stencil radius of
+        its `halo=0` derivatives, per root Dimension.
+        """
+        grid = Grid(shape=(24, 24))
+        x, y = grid.dimensions
+        subdomain = Region('s', {'x': ('left', 6), 'y': ('left', 6)}, grid=grid)
+        f = Function(name='f', grid=grid, space_order=8)
+        g = Function(name='g', grid=grid, space_order=8)
+
+        rhs = (f.dx(halo=0) + f.dy(fd_order=4, halo=0) + f.dx(fd_order=2))
+        eq = Eq(g, rhs, subdomain=subdomain).evaluate
+
+        assert rhs._has_zero_halo
+        assert eq.subdomain.growth == {x: 4, y: 2}
+
+    def test_cpml_adjoint(self):
+        """
+        Dot test of a one-face CPML derivative written on the CPML strip S only.
+
+            forward: out = D q + psi[n+1]                on S
+                     psi[n+1] = b psi[n] + a D q         on S
+            adjoint: q_bar += D^T (out_bar + a (psi_bar + out_bar)),
+                     with halo=0 and subdomain=S
+
+        The adjoint needs neither a zero-padded work field nor a mask.
+        """
+        nx, width, so, nt = 32, 10, 8, 8
+        grid = Grid(shape=(nx,), extent=(float(nx - 1),), dtype=np.float64)
+        time = grid.time_dim
+        x = grid.dimensions[0]
+        strip = Region('strip', {'x': ('left', width)}, grid=grid)
+
+        kwargs = {'grid': grid, 'save': nt, 'space_order': so, 'dtype': np.float64}
+        q = TimeFunction(name='q', **kwargs)
+        out = TimeFunction(name='out', **kwargs)
+        q_bar = TimeFunction(name='q_bar', **kwargs)
+        out_bar = TimeFunction(name='out_bar', **kwargs)
+        psi = TimeFunction(name='psi', grid=strip, time_order=1, space_order=so,
+                           dtype=np.float64)
+        # The adjoint stencil reads psi_bar one radius past the grown strip
+        psi_bar = TimeFunction(name='psi_bar', grid=strip, time_order=1,
+                               space_order=(so, so, so), dtype=np.float64)
+        a = Function(name='a', grid=grid, dimensions=(x,), shape=(nx,),
+                     space_order=so, dtype=np.float64)
+        b = Function(name='b', grid=grid, dimensions=(x,), shape=(nx,),
+                     dtype=np.float64)
+        a.data[:6] = -0.1
+        b.data[:] = 1.
+        b.data[:6] = 0.8
+
+        forward = Operator([
+            Eq(psi.forward, b * psi + a * q.dx, subdomain=strip),
+            Eq(out, q.dx + psi.forward, subdomain=strip)
+        ])
+        value = psi_bar + out_bar
+        adjoint = Operator([
+            Eq(psi_bar.backward, b * value, subdomain=strip, implicit_dims=(time,)),
+            Inc(q_bar, (out_bar + a * value).dx(halo=0).T, subdomain=strip,
+                implicit_dims=(time,))
+        ])
+
+        # A single time loop
+        assert str(adjoint.ccode).count('for (int time') == 1
+
+        rng = np.random.default_rng(7)
+        q.data[:] = rng.normal(size=q.shape)
+        out_bar.data[:] = rng.normal(size=out_bar.shape)
+        forward.apply(time_m=0, time_M=nt - 1)
+        adjoint.apply(time_m=0, time_M=nt - 1)
+
+        lhs = np.vdot(out.data, out_bar.data)
+        rhs = np.vdot(q.data, q_bar.data)
+        assert np.isclose(lhs, rhs, rtol=1e-12)

@@ -1,0 +1,708 @@
+from ctypes import POINTER, c_void_p
+
+import cgen
+import numpy as np
+import pytest
+import sympy
+
+from devito import (  # noqa
+    Dimension, Eq, Function, Grid, Operator, TimeFunction, switchconfig
+)
+from devito.ir import SymbolRegistry
+from devito.ir.iet import (
+    Call, Callable, CGen, Conditional, Definition, Dereference, DeviceCall, DummyExpr,
+    ElementalFunction, FindNodes, FindSymbols, Iteration, KernelLaunch, Lambda, List,
+    Switch, ThreadFence, Transformer, filter_iterations, make_callable, make_efunc,
+    retrieve_iteration_tree
+)
+from devito.ir.iet.visitors import sorted_efuncs
+from devito.passes.iet.engine import Graph, reuse_efuncs
+from devito.passes.iet.languages.C import CDataManager
+from devito.symbolics import (
+    FLOAT, Byref, Class, FieldFromComposite, InlineIf, ListInitializer, Macro, SizeOf,
+    String
+)
+from devito.symbolics.extended_dtypes import c_complex
+from devito.tools import CustomDtype, as_tuple, dtype_to_ctype
+from devito.types import (
+    Array, Bundle, CustomDimension, LocalObject, Pointer, Symbol, Temp
+)
+from devito.types.misc import FunctionMap
+
+
+@pytest.fixture
+def grid():
+    return Grid((3, 3, 3))
+
+
+@pytest.fixture
+def fc(grid):
+    return Array(name='fc', dimensions=(grid.dimensions[0], grid.dimensions[1]),
+                 shape=(3, 5)).indexed
+
+
+def test_conditional(fc, grid):
+    x, y, _ = grid.dimensions
+    then_body = DummyExpr(fc[x, y], fc[x, y] + 1)
+    else_body = DummyExpr(fc[x, y], fc[x, y] + 2)
+    conditional = Conditional(x < 3, then_body, else_body)
+    assert str(conditional) == """\
+if (x < 3)
+{
+  fc[x][y] = fc[x][y] + 1;
+}
+else
+{
+  fc[x][y] = fc[x][y] + 2;
+}"""
+
+
+@pytest.mark.parametrize("exprs,nfuncs,ntimeiters,nests", [
+    (('Eq(v[t+1,x,y], v[t,x,y] + 1)',), (1,), (2,), ('xy',)),
+    (('Eq(v[t,x,y], v[t,x-1,y] + 1)', 'Eq(v[t,x,y], v[t,x+1,y] + u[x,y])'),
+     (1, 2), (1, 1), ('xy', 'xy'))
+])
+@switchconfig(language='C')
+def test_make_efuncs(exprs, nfuncs, ntimeiters, nests):
+    """Test construction of ElementalFunctions."""
+    exprs = list(as_tuple(exprs))
+
+    grid = Grid(shape=(10, 10))
+    t = grid.stepping_dim  # noqa
+    x, y = grid.dimensions  # noqa
+
+    u = Function(name='u', grid=grid)  # noqa
+    v = TimeFunction(name='v', grid=grid)  # noqa
+
+    # List comprehension would need explicit locals/globals mappings to eval
+    for i, e in enumerate(list(exprs)):
+        exprs[i] = eval(e)
+
+    op = Operator(exprs)
+
+    # We create one ElementalFunction for each Iteration nest over space dimensions
+    efuncs = []
+    for n, tree in enumerate(retrieve_iteration_tree(op)):
+        root = filter_iterations(tree, key=lambda i: i.dim.is_Space)[0]
+        efuncs.append(make_efunc(f'f{n}', root))
+
+    assert len(efuncs) == len(nfuncs) == len(ntimeiters) == len(nests)
+
+    for efunc, nf, nt, nest in zip(efuncs, nfuncs, ntimeiters, nests, strict=True):
+        # Check the `efunc` parameters
+        assert all(i in efunc.parameters for i in (x.symbolic_min, x.symbolic_max))
+        assert all(i in efunc.parameters for i in (y.symbolic_min, y.symbolic_max))
+        functions = FindSymbols().visit(efunc)
+        assert len(functions) == nf
+        assert all(i in efunc.parameters for i in functions)
+        timeiters = [i for i in FindSymbols('basics').visit(efunc)
+                     if isinstance(i, Dimension) and i.is_Time]
+        assert len(timeiters) == nt
+        assert all(i in efunc.parameters for i in timeiters)
+        assert len(efunc.parameters) == 4 + len(functions) + len(timeiters)
+
+        # Check the loop nest structure
+        trees = retrieve_iteration_tree(efunc)
+        assert len(trees) == 1
+        tree = trees[0]
+        assert all(i.dim.name == j for i, j in zip(tree, nest, strict=True))
+
+        assert efunc.make_call()
+
+
+def test_nested_calls_cgen():
+    call = Call('foo', [
+        Call('bar', [])
+    ])
+
+    code = CGen().visit(call)
+
+    assert str(code) == 'foo(bar());'
+
+
+def test_thread_fence_cgen():
+    """
+    A fence renders as the builtin, which is valid in C and C++ alike.
+
+    Threads that hand work to each other through a shared flag need one either
+    side of the handshake; without them the stores can be observed out of order
+    and a hand-off is lost.
+    """
+    assert str(CGen().visit(ThreadFence('acquire'))) == \
+        '__atomic_thread_fence(__ATOMIC_ACQUIRE);'
+    assert str(CGen().visit(ThreadFence('release'))) == \
+        '__atomic_thread_fence(__ATOMIC_RELEASE);'
+
+    with pytest.raises(AssertionError):
+        ThreadFence('seq_cst')
+
+
+@pytest.mark.parametrize('mode,expected', [
+    ('basics', '["x"]'),
+    ('symbolics', '["f"]')
+])
+def test_find_symbols_nested(mode, expected):
+    grid = Grid(shape=(4, 4, 4))
+    call = Call('foo', [
+        Call('bar', [
+            Symbol(name='x'),
+            Call('baz', [Function(name='f', grid=grid)])
+        ])
+    ])
+
+    found = FindSymbols(mode).visit(call)
+
+    assert [f.name for f in found] == eval(expected)
+
+
+def test_find_symbols_natural_numbering():
+    temporaries = [Temp(name=f'r{i}') for i in range(12)]
+    call = Call('foo', temporaries[::-1])
+
+    found = FindSymbols('basics').visit(call)
+
+    assert [i.name for i in found] == [i.name for i in temporaries]
+
+
+def test_list_denesting():
+    l0 = List(header=cgen.Line('a'), body=List(header=cgen.Line('b')))
+    l1 = l0._rebuild(body=List(header=cgen.Line('c')))
+    assert len(l0.body) == 0
+    assert len(l1.body) == 0
+    assert str(l1) == "a\nb\nc"
+
+    l2 = l1._rebuild(l1.body)
+    assert len(l2.body) == 0
+    assert str(l2) == str(l1)
+
+    l3 = l2._rebuild(l2.body, **l2.args_frozen)
+    assert len(l3.body) == 0
+    assert str(l3) == str(l2)
+
+
+def test_lambda():
+    grid = Grid(shape=(4, 4, 4))
+    x, y, z = grid.dimensions
+
+    u = Function(name='u', grid=grid)
+
+    e0 = DummyExpr(u.indexed, 1)
+    e1 = DummyExpr(u.indexed, 2)
+
+    body = List(body=[e0, e1])
+    lam = Lambda(body, ['='], [u.indexed], attributes=['my_attr'])
+
+    assert str(lam) == """\
+[=](float *restrict u) [[my_attr]]
+{
+  u = 1;
+  u = 2;
+}"""
+
+
+def test_make_cpp_parfor():
+    """
+    Test construction of a C++ parallel for. This excites the IET construction
+    machinery in several ways, in particular by using Lambda nodes (to generate
+    C++ lambda functions) and nested Calls.
+    """
+
+    class STDVectorThreads(LocalObject):
+
+        dtype = type('std::vector<std::thread>', (c_void_p,), {})
+
+        def __init__(self):
+            super().__init__('threads')
+
+    class STDThread(LocalObject):
+
+        dtype = type('std::thread&', (c_void_p,), {})
+
+    class FunctionType(LocalObject):
+
+        dtype = type('FuncType&&', (c_void_p,), {})
+
+    # Basic symbols
+    nthreads = Symbol(name='nthreads', is_const=True)
+    threshold = Symbol(name='threshold', is_const=True)
+    last = Symbol(name='last', is_const=True)
+    first = Symbol(name='first', is_const=True)
+    portion = Symbol(name='portion', is_const=True)
+
+    # Composite symbols
+    threads = STDVectorThreads()
+
+    # Iteration helper symbols
+    begin = Symbol(name='begin')
+    l = Symbol(name='l')
+    end = Symbol(name='end')
+
+    # Functions
+    stdmax = sympy.Function('std::max')
+
+    # Construct the parallel-for body
+    func = FunctionType('func')
+    i = Dimension(name='i')
+    threadobj = Call('std::thread', Lambda(
+        Iteration(Call(func.name, i), i, (begin, end-1, 1)),
+        ['=', Byref(func.name)],
+    ))
+    threadpush = Call(FieldFromComposite('push_back', threads), threadobj)
+    it = Dimension(name='it')
+    iteration = Iteration([
+        DummyExpr(begin, it, init=True),
+        DummyExpr(l, it + portion, init=True),
+        DummyExpr(end, InlineIf(l > last, last, l), init=True),
+        threadpush
+    ], it, (first, last, portion))
+    thread = STDThread('x')
+    waitcall = Call('std::for_each', [
+        Call(FieldFromComposite('begin', threads)),
+        Call(FieldFromComposite('end', threads)),
+        Lambda(Call(FieldFromComposite('join', thread.name)), [], [thread])
+    ])
+    body = [
+        DummyExpr(threshold, 1, init=True),
+        DummyExpr(portion, stdmax(threshold, (last - first) / nthreads), init=True),
+        Call(FieldFromComposite('reserve', threads), nthreads),
+        iteration,
+        waitcall
+    ]
+
+    parfor = ElementalFunction('parallel_for', body,
+                               parameters=[first, last, func, nthreads])
+
+    assert str(parfor) == """\
+static \
+void parallel_for(const int first, const int last, FuncType&& func, const int nthreads)
+{
+  const int threshold = 1;
+  const int portion = std::max(threshold, (-first + last)/nthreads);
+  threads.reserve(nthreads);
+  for (int it = first; it <= last; it += portion)
+  {
+    int begin = it;
+    int l = it + portion;
+    int end = (l > last) ? last : l;
+    threads.push_back(std::thread([=, &func]()
+    {
+      for (int i = begin; i <= end - 1; i += 1)
+      {
+        func(i);
+      }
+    }));
+  }
+  std::for_each(threads.begin(),threads.end(),[](std::thread& x)
+  {
+    x.join();
+  });
+}"""
+
+
+def test_make_cuda_stream():
+
+    class CudaStream(LocalObject):
+
+        dtype = type('cudaStream_t', (c_void_p,), {})
+
+        @property
+        def _C_init(self):
+            return Call('cudaStreamCreate', Byref(self))
+
+        @property
+        def _C_free(self):
+            return Call('cudaStreamDestroy', self)
+
+    stream = CudaStream('stream')
+
+    iet = Call('foo', stream)
+    iet = ElementalFunction('foo', iet, parameters=())
+    dm = CDataManager(sregistry=None)
+    iet = CDataManager.place_definitions.__wrapped__(dm, iet)[0]
+
+    assert str(iet) == """\
+static void foo()
+{
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+
+  foo(stream);
+
+  cudaStreamDestroy(stream);
+}"""
+
+
+def test_make_cuda_tensor_map():
+
+    class CUTensorMap(FunctionMap):
+
+        dtype = CustomDtype('CUtensorMap')
+
+        @property
+        def _C_init(self):
+            symsizes = list(reversed(self.tensor.symbolic_shape))
+            sizeof_dtype = SizeOf(self.tensor.dmap._C_typedata)
+
+            sizes = ListInitializer(symsizes)
+            strides = ListInitializer([
+                np.prod(symsizes[:i])*sizeof_dtype for i in range(1, len(symsizes))
+            ])
+
+            arguments = [
+                Byref(self),
+                Macro('CU_TENSOR_MAP_DATA_TYPE_FLOAT32'),
+                4, self.tensor.dmap, sizes, strides,
+            ]
+            call = Call('cuTensorMapEncodeTiled', arguments)
+
+            return call
+
+    grid = Grid(shape=(10, 10, 10))
+
+    u = TimeFunction(name='u', grid=grid)
+
+    tmap = CUTensorMap('tmap', u)
+
+    iet = Call('foo', tmap)
+    iet = ElementalFunction('foo', iet, parameters=())
+    dm = CDataManager(sregistry=None)
+    iet = CDataManager.place_definitions.__wrapped__(dm, iet)[0]
+
+    assert str(iet) == """\
+static void foo()
+{
+  CUtensorMap tmap;
+  cuTensorMapEncodeTiled(&tmap,CU_TENSOR_MAP_DATA_TYPE_FLOAT32,4,d_u,{u_vec->size[3], u_vec->size[2], u_vec->size[1], u_vec->size[0]},{sizeof(float)*u_vec->size[3], sizeof(float)*u_vec->size[2]*u_vec->size[3], sizeof(float)*u_vec->size[1]*u_vec->size[2]*u_vec->size[3]});
+
+  foo(tmap);
+}"""  # noqa
+
+
+def test_cpp_local_object():
+    """
+    Test C++ support for LocalObjects.
+    """
+
+    class MyObject(LocalObject):
+        dtype = CustomDtype('dummy')
+
+    # Locally-scoped objects are declared in the function body
+    lo0 = MyObject('obj0')
+
+    # Globally-scoped objects must not be declared in the function body
+    lo1 = MyObject('obj1', scope='global')
+
+    # A LocalObject using both a template and a modifier
+    class SpecialObject(LocalObject):
+        dtype = CustomDtype('bar', template=('int', 'float'), modifier='&')
+
+    lo2 = SpecialObject('obj2')
+
+    # A LocalObject instantiated and subsequently assigned a value
+    lo3 = MyObject('obj3', initvalue=Macro('meh'))
+
+    # A LocalObject instantiated calling its 2-args constructor and subsequently
+    # assigned a value
+    lo4 = MyObject('obj4', cargs=(1, 2), initvalue=Macro('meh'))
+
+    # A LocalObject with generic sympy exprs used as constructor args
+    expr = sympy.Function('ceil')(FLOAT(Symbol(name='s'))**-1)
+    lo5 = MyObject('obj5', cargs=(expr,), initvalue=Macro('meh'))
+
+    # A LocalObject with class-level initvalue and numeric dtype
+    class SpecialObject2(LocalObject):
+        dtype = dtype_to_ctype(np.float32)
+        default_initvalue = Macro('meh')
+
+    lo6 = SpecialObject2('obj6')
+
+    iet = Call('foo', [lo0, lo1, lo2, lo3, lo4, lo5, lo6])
+    iet = ElementalFunction('foo', iet, parameters=())
+
+    dm = CDataManager(sregistry=None)
+    iet = CDataManager.place_definitions.__wrapped__(dm, iet)[0]
+
+    assert 'dummy obj0;' in str(iet)
+    assert 'dummy obj1;' not in str(iet)
+    assert 'bar<int,float>& obj2;' in str(iet)
+    assert 'dummy obj3 = meh;' in str(iet)
+    assert 'dummy obj4(1,2) = meh;' in str(iet)
+    assert 'dummy obj5(ceil(1.0F/(float)s)) = meh;' in str(iet)
+    assert 'float obj6 = meh;' in str(iet)
+
+
+def test_call_indexed():
+    grid = Grid(shape=(10, 10))
+
+    u = Function(name='u', grid=grid)
+
+    foo = Callable('foo', DummyExpr(u, 1), 'void', parameters=[u, u.indexed])
+    call = Call(foo.name, [u, u.indexed])
+
+    assert str(call) == "foo(u_vec,u);"
+    assert str(foo) == """\
+void foo(struct dataobj *restrict u_vec, float *restrict u)
+{
+  u(x, y) = 1;
+}"""
+
+
+def test_call_retobj_indexed():
+    grid = Grid(shape=(10, 10))
+
+    u = Function(name='u', grid=grid)
+    v = Function(name='v', grid=grid)
+
+    call = Call('foo', [u], retobj=v.indexify())
+
+    assert str(call) == "v[x][y] = foo(u_vec);"
+
+    assert not call.defines
+
+
+def test_call_lambda_transform():
+    grid = Grid(shape=(10, 10))
+    x, y = grid.dimensions
+
+    u = Function(name='u', grid=grid)
+
+    e0 = DummyExpr(x, 1)
+    e1 = DummyExpr(y, 1)
+
+    body = List(body=[e0, e1])
+    call = Call('foo', [u, Lambda(body)])
+
+    subs = {e0: DummyExpr(x, 2), e1: DummyExpr(y, 2)}
+
+    assert str(Transformer(subs).visit(call)) == """\
+foo(u_vec,[]()
+{
+  x = 2;
+  y = 2;
+});"""
+
+
+def test_null_init():
+    grid = Grid(shape=(10, 10))
+
+    u = Function(name='u', grid=grid)
+
+    expr = DummyExpr(u.indexed, Macro('NULL'), init=True)
+
+    assert str(expr) == "float * u = NULL;"
+    assert expr.defines == (u.indexed,)
+
+
+def test_templates_callable():
+    grid = Grid(shape=(10, 10))
+    x, y = grid.dimensions
+
+    u = Function(name='u', grid=grid)
+
+    foo = Callable('foo', DummyExpr(u, 1), 'void', parameters=[u],
+                   templates=[x, y])
+
+    assert str(foo) == """\
+template <int x, int y>
+void foo(struct dataobj *restrict u_vec)
+{
+  u(x, y) = 1;
+}"""
+
+
+@pytest.mark.parametrize('cls', [Call, DeviceCall])
+def test_templates_call(cls):
+    grid = Grid(shape=(10, 10))
+    x, y = grid.dimensions
+
+    u = Function(name='u', grid=grid)
+
+    foo = cls('foo', u, templates=[Class('a'), Class('b')])
+
+    assert str(foo) == "foo<class a, class b>(u_vec);"
+
+
+def test_kernel_launch():
+    grid = Grid(shape=(10, 10))
+
+    u = Function(name='u', grid=grid)
+    s = Symbol(name='s')
+
+    class Dim3(LocalObject):
+        dtype = type('dim3', (c_void_p,), {})
+
+    kl = KernelLaunch('mykernel', Dim3('mygrid'), Dim3('myblock'),
+                      arguments=(u.indexed,), templates=[s])
+
+    assert str(kl) == 'mykernel<s><<<mygrid,myblock,0>>>(d_u);'
+
+
+def test_codegen_quality0():
+    grid = Grid(shape=(4, 4, 4))
+    _, y, z = grid.dimensions
+
+    a = Array(name='a', dimensions=grid.dimensions)
+
+    expr = DummyExpr(a.indexed, 1)
+    foo = Callable('foo', expr, 'void',
+                   parameters=[a, y.symbolic_size, z.symbolic_size])
+
+    # Emulate what the compiler would do
+    graph = Graph(foo)
+
+    CDataManager(sregistry=SymbolRegistry()).process(graph)
+
+    foo1 = graph.root
+
+    assert len(foo.parameters) == 3
+    assert len(foo1.parameters) == 1
+    assert foo1.parameters[0] is a
+
+
+def test_reuse_efuncs_natural_numbering():
+
+    def make_foo(name, start):
+        pointers = [Pointer(name=f'p{i}') for i in range(start, start + 3)]
+        return make_callable(name, Call('bar', pointers))
+
+    foo0 = make_foo('foo0', 0)
+    foo1 = make_foo('foo1', 9)
+
+    root = make_callable('root', List(body=[
+        Call(foo0.name, foo0.parameters),
+        Call(foo1.name, foo1.parameters)
+    ]))
+    efuncs = {i.name: i for i in (root, foo0, foo1)}
+
+    efuncs = reuse_efuncs(root, efuncs)
+
+    assert set(efuncs) == {'root', 'foo0'}
+    calls = FindNodes(Call).visit(efuncs[root.name])
+    assert [i.name for i in calls] == ['foo0', 'foo0']
+
+
+def test_sorted_efuncs_natural_numbering():
+    names = ['kernel3', 'foo0', 'kernel11', 'kernel1', 'kernel2']
+    efuncs = [make_callable(name, List()) for name in names]
+
+    assert [i.name for i in sorted_efuncs(efuncs)] == [
+        'foo0', 'kernel1', 'kernel2', 'kernel3', 'kernel11'
+    ]
+
+
+def test_complex_array():
+    grid = Grid(shape=(4, 4, 4))
+    _, y, z = grid.dimensions
+
+    a = Array(name='a', dimensions=grid.dimensions, dtype=POINTER(c_complex))
+
+    assert str(Definition(a)) == \
+        "float _Complex **restrict a_vec __attribute__ ((aligned (64)));"
+
+
+def test_special_array_definition():
+
+    class MyArray(Array):
+        is_extern = True
+        _data_alignment = False
+
+    dim = CustomDimension(name='d', symbolic_size=String(''))
+    a = MyArray(name='a', dimensions=dim, scope='shared', dtype=np.uint8)
+
+    assert str(Definition(a)) == "extern  unsigned char a[];"
+
+
+@pytest.mark.parametrize('left,right,expected', [
+    ([0], [0], ((0, 0),)),
+    ([1, 2], [3], ((1, 3), (2, 0))),
+    (None, [4], ((0, 4),)),
+    (None, None, None),
+])
+def test_bundle_initializer(left, right, expected):
+    d = CustomDimension(name='d', symbolic_size=4)
+
+    a = Array(name='a', dimensions=d, scope='stack', initvalue=left)
+    b = Array(name='b', dimensions=d, scope='stack', initvalue=right)
+    ab = Bundle(name='ab', components=(a, b))
+
+    code = str(Definition(ab))
+    if expected is None:
+        assert ab.initvalue is None
+        assert ' = ' not in code
+    else:
+        assert tuple(i.params for i in ab.initvalue) == expected
+        initializer = ', '.join('{' + ', '.join(map(str, i)) + '}' for i in expected)
+        assert code.endswith(f' = {{{initializer}}};')
+
+
+def test_bundle_initializer_symbols():
+    d = CustomDimension(name='d', symbolic_size=4)
+    s = Symbol(name='s')
+
+    a = Array(name='a', dimensions=d, scope='stack', initvalue=[s])
+    b = Array(name='b', dimensions=d, scope='stack', initvalue=[sympy.Float(0.5)])
+    ab = Bundle(name='ab', components=(a, b))
+
+    definition = Definition(ab)
+    assert definition.expr_symbols == (s,)
+    assert str(definition).endswith(' = {{s, 5.0e-1F}};')
+
+
+def test_bundle_initializer_multidimensional():
+    x = CustomDimension(name='x', symbolic_size=2)
+    y = CustomDimension(name='y', symbolic_size=2)
+
+    a = Array(name='a', dimensions=(x, y), scope='stack', initvalue=[1, 2, 3])
+    b = Array(name='b', dimensions=(x, y), scope='stack', initvalue=[4, 5])
+    ab = Bundle(name='ab', components=(a, b))
+
+    assert str(Definition(ab)).endswith(' = {{{1, 4}, {2, 5}}, {{3, 0}}};')
+
+
+def test_list_inline():
+    expr0 = DummyExpr(Symbol(name='a'), 1)
+    expr1 = DummyExpr(Symbol(name='b'), 2)
+
+    lst = List(body=[expr0, expr1], inline=True)
+    assert str(lst) == """a = 1; b = 2;"""
+
+
+def test_dereference_base_plus_off():
+    ptr = Pointer(name='p', dtype=np.float32)
+    off = Symbol(name='offs', dtype=np.int32)
+
+    dim0 = CustomDimension(name='d0', symbolic_size=2)
+    dim1 = CustomDimension(name='d1', symbolic_size=3)
+    x = Array(name='x', dimensions=(dim0, dim1), dtype=np.float32)
+
+    deref = Dereference(x, ptr, offset=off)
+
+    assert str(deref) == "float (*restrict x)[3] = (float (*)[3]) (p + offs);"
+
+
+def test_switch_case():
+    flag = Symbol(name='flag')
+    a = Symbol(name='a')
+
+    cases = [0, 1]
+    nodes = [DummyExpr(a, 1), DummyExpr(a, 2)]
+    default = DummyExpr(a, 0)
+
+    switch = Switch(flag, cases, nodes, default=default)
+
+    assert str(switch) == """\
+switch (flag)
+{
+  case 0: {
+    a = 1;
+    break;
+  }
+  case 1: {
+    a = 2;
+    break;
+  }
+  default: {
+    a = 0;
+    break;
+  }
+}"""

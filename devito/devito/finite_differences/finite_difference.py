@@ -1,0 +1,271 @@
+from collections.abc import Iterable
+from contextlib import suppress
+
+from sympy import sympify
+
+from devito.logger import warning
+
+from .differentiable import DiffDerivative, EvalDerivative, Weights
+from .tools import (
+    centered, check_input, direct, fd_weights_registry, generate_indices, left,
+    process_weights, right, transpose
+)
+
+__all__ = [
+    'centered',
+    'cross_derivative',
+    'first_derivative',
+    'generate_indices',
+    'generic_derivative',
+    'left',
+    'right',
+    'transpose',
+]
+
+# Number of digits for FD coefficients to avoid roundup errors and non-deterministic
+# code generation
+_PRECISION = 9
+
+
+@check_input
+def cross_derivative(expr, dims, fd_order, deriv_order, x0=None, side=None, **kwargs):
+    """
+    Arbitrary-order cross derivative of a given expression.
+
+    Parameters
+    ----------
+    expr : expr-like
+        Expression for which the cross derivative is produced.
+    dims : tuple of Dimension
+        Dimensions w.r.t. which to differentiate.
+    fd_order : int, optional, default=expr.space_order
+        Coefficient discretization order. Note: this impacts the width of
+        the resulting stencil.
+    side : Side, optional, default=centered
+        Side of the finite difference location, centered (at x), left (at x - 1)
+        or right (at x +1).
+    matvec : Transpose, optional, default=direct
+        Forward (matvec=direct) or transpose (matvec=transpose) mode of the
+        finite difference.
+    x0 : dict, optional, default=None
+        Origin of the finite-difference scheme as a map dim: origin_dim.
+    coefficients : string, optional, default='taylor'
+        Use taylor or custom coefficients (weights).
+    expand : bool, optional, default=True
+        If True, the derivative is fully expanded as a sum of products,
+        otherwise an IndexSum is returned.
+
+    Returns
+    -------
+    expr-like
+        Cross-derivative of ``expr``.
+
+    Examples
+    --------
+    >>> from devito import Function, Grid
+    >>> grid = Grid(shape=(4, 4))
+    >>> x, y = grid.dimensions
+    >>> f = Function(name='f', grid=grid, space_order=2)
+    >>> g = Function(name='g', grid=grid, space_order=2)
+    >>> cross_derivative(f*g, dims=(x, y), fd_order=(2, 2), deriv_order=(1, 1))
+    (-1/h_y)*(-f(x, y)*g(x, y)/h_x + f(x + h_x, y)*g(x + h_x, y)/h_x) + \
+(-f(x, y + h_y)*g(x, y + h_y)/h_x + f(x + h_x, y + h_y)*g(x + h_x, y + h_y)/h_x)/h_y
+
+    Semantically, this is equivalent to
+
+    >>> (f*g).dxdy
+    Derivative(f(x, y)*g(x, y), x, y)
+
+    The only difference is that in the latter case derivatives remain unevaluated.
+    The expanded form is obtained via ``evaluate``
+
+    >>> (f*g).dxdy.evaluate
+    (-1/h_y)*(-f(x, y)*g(x, y)/h_x + f(x + h_x, y)*g(x + h_x, y)/h_x) + \
+(-f(x, y + h_y)*g(x, y + h_y)/h_x + f(x + h_x, y + h_y)*g(x + h_x, y + h_y)/h_x)/h_y
+
+    Finally the x0 argument allows to choose the origin of the finite-difference
+
+    >>> cross_derivative(f*g, dims=(x, y), fd_order=(2, 2), deriv_order=(1, 1), \
+    x0={x: x + x.spacing, y: y + y.spacing})
+    (-1/h_y)*(-f(x + h_x, y + h_y)*g(x + h_x, y + h_y)/h_x + \
+f(x + 2*h_x, y + h_y)*g(x + 2*h_x, y + h_y)/h_x) + \
+(-f(x + h_x, y + 2*h_y)*g(x + h_x, y + 2*h_y)/h_x + \
+f(x + 2*h_x, y + 2*h_y)*g(x + 2*h_x, y + 2*h_y)/h_x)/h_y
+    """
+    x0 = x0 or {}
+    for d, fd, dim in zip(deriv_order, fd_order, dims, strict=True):
+        expr = generic_derivative(expr, dim=dim, fd_order=fd, deriv_order=d, x0=x0,
+                                  side=side, **kwargs)
+
+    return expr
+
+
+def indices_at(expr, dim):
+    """
+    The locations `expr`'s terms sit at along `dim`.
+
+    Terms with no location of their own, a scalar say, contribute none.
+    """
+    indices = set()
+    for i in (expr.args if expr.is_Add else (expr,)):
+        try:
+            indices.add(i.indices_ref[dim])
+        except (AttributeError, KeyError, IndexError, TypeError):
+            continue
+    return indices
+
+
+def index_at(expr, dim):
+    """
+    Where `expr` sits along `dim`, or None if it does not say.
+    """
+    indices = indices_at(expr, dim)
+    return indices.pop() if len(indices) == 1 else None
+
+
+@check_input
+def generic_derivative(expr, dim, fd_order, deriv_order, matvec=direct, x0=None,
+                       coefficients='taylor', expand=True, weights=None, side=None,
+                       subdomain=None):
+    """
+    Arbitrary-order derivative of a given expression.
+
+    Parameters
+    ----------
+    expr : expr-like
+        Expression for which the derivative is produced.
+    dim : Dimension
+        The Dimension w.r.t. which to differentiate.
+    fd_order : int, optional, default=expr.space_order
+        Coefficient discretization order. Note: this impacts the width of
+        the resulting stencil.
+    side : Side, optional, default=centered
+        Side of the finite difference location, centered (at x), left (at x - 1)
+        or right (at x +1).
+    matvec : Transpose, optional, default=direct
+        Forward (matvec=direct) or transpose (matvec=transpose) mode of the
+        finite difference.
+    x0 : dict, optional, default=None
+        Origin of the finite-difference scheme as a map dim: origin_dim.
+    coefficients : string, optional, default='taylor'
+        Use taylor or custom coefficients (weights).
+    expand : bool, optional, default=True
+        If True, the derivative is fully expanded as a sum of products,
+        otherwise an IndexSum is returned.
+    subdomain : SubDomain, optional
+        If given, `expr` is treated as zero outside `subdomain` (see
+        `Derivative`'s `halo`): each stencil tap is multiplied by the
+        indicator of `subdomain` at the point it reads.
+
+    Returns
+    -------
+    expr-like
+        ``deriv-order`` derivative of ``expr``.
+    """
+    # First order derivative with 2nd order FD is strongly discouraged so taking
+    # first order fd that is a lot better
+    if deriv_order == 1 and fd_order == 2 and side is None:
+        fd_order = 1
+
+    # Zeroth order is the identity when `expr` already sits at `x0`, not a
+    # stencil centred there.
+    if deriv_order == 0 and (not x0 or index_at(expr, dim) == x0.get(dim)):
+        return expr
+
+    # Enforce stable time coefficients
+    coefficients = 'taylor' if dim.is_Time else expr.coefficients
+
+    return make_derivative(expr, dim, fd_order, deriv_order, side,
+                           matvec, x0, coefficients, expand, weights, subdomain)
+
+
+# Backward compatibility
+def first_derivative(expr, dim, fd_order, **kwargs):
+    return generic_derivative(expr, dim, fd_order, 1, **kwargs)
+
+
+def make_derivative(expr, dim, fd_order, deriv_order, side, matvec, x0, coefficients,
+                    expand, weights=None, subdomain=None):
+    # Always expand time derivatives to avoid issue with buffering and streaming.
+    # Time derivative are almost always short stencils and won't benefit from
+    # unexpansion in the rare case the derivative is not evaluated for time stepping.
+    expand = True if dim.is_Time else expand
+
+    # The stencil indices
+    nweights, wdim, scale = process_weights(weights, expr, dim)
+    indices, x0 = generate_indices(expr, dim, fd_order, side=side, matvec=matvec,
+                                   x0=x0, nweights=nweights)
+    # Finite difference weights corresponding to the indices. Computed via the
+    # `coefficients` method (`taylor` or `symbolic`)
+    if weights is None:
+        weights = fd_weights_registry[coefficients](expr, deriv_order, indices, x0)
+        _, wdim, _ = process_weights(weights, expr, dim)
+    elif isinstance(weights, Iterable) and len(weights) != len(indices):
+        warning(f"Number of weights ({len(weights)}) does not match "
+                f"number of indices ({len(indices)}), reverting to Taylor")
+        scale = False
+        wdim = None
+        weights = fd_weights_registry['taylor'](expr, deriv_order, indices, x0)
+
+    # Did fd_weights_registry return a new Function/Expression instead of a values?
+    if wdim is not None:
+        weights = [weights._subs(wdim, i) for i in range(len(indices))]
+
+    # Enforce fixed precision FD coefficients to avoid variations in results
+    scale = dim.spacing**(-deriv_order) if scale else 1
+    weights = [sympify(scale * w).evalf(_PRECISION) for w in weights]
+
+    # Transpose the FD, if necessary
+    if matvec == transpose:
+        weights = weights[::-1]
+        indices = indices.transpose()
+
+    # Shift index due to staggering, if any
+    indices = indices.shift(-(expr.indices_ref[dim] - dim))
+
+    # The user may wish to restrict expansion to selected derivatives
+    if callable(expand):
+        expand = expand(dim)
+
+    # With a `subdomain`, `expr` is treated as zero outside it: every stencil tap
+    # is multiplied by the indicator of the point it reads, 1 if `subdomain`
+    # spans the whole of `dim`. The derivative then extends past `subdomain` by
+    # the stencil radius
+    growth = {dim.root: indices.radius} if subdomain is not None else {}
+
+    if not expand and indices.expr is not None:
+        weights = Weights(name='w', dimensions=indices.free_dim,
+                          initvalue=weights, dtype=expr.dtype)
+
+        # Inject the StencilDimension
+        # E.g. `x + i*h_x` into `f(x)` s.t. `f(x + i*h_x)`
+        expr = expr.shift(dim, indices.expr - dim)
+        if subdomain is not None:
+            expr = expr * subdomain._indicator(dim.root, indices.offset(indices.expr))
+
+        # Re-evaluate any off-the-grid Functions potentially impacted by the FD
+        # unless a pure number
+        with suppress(AttributeError):
+            expr = expr._evaluate(expand=False)
+
+        deriv = DiffDerivative(
+            expr*weights, {dim: indices.free_dim}, deriv_order=deriv_order,
+            growth=growth
+        )
+    else:
+        terms = []
+        for i, c in zip(indices, weights, strict=True):
+            # The FD term
+            term = expr.shift(dim, i - dim) * c
+            if subdomain is not None:
+                term = term * subdomain._indicator(dim.root, indices.offset(i))
+
+            # Re-evaluate any off-the-grid Functions potentially impacted by the FD
+            # unless a pure number
+            with suppress(AttributeError):
+                term = term.evaluate
+            terms.append(term)
+
+        deriv = EvalDerivative(*terms, base=expr, growth=growth)
+
+    return deriv

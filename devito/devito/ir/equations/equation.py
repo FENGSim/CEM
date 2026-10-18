@@ -1,0 +1,400 @@
+from contextlib import suppress
+from functools import cached_property
+
+import numpy as np
+import sympy
+
+from devito.finite_differences.differentiable import LocalSum, diff2sympy
+from devito.ir.equations.algorithms import dimension_sort, generate_conditionals
+from devito.ir.support import (
+    Interval, IntervalGroup, IterationSpace, Stencil, bounded, detect_accesses
+)
+from devito.symbolics import limits_mapper, retrieve_accesses, search
+from devito.tools import (
+    Pickable, Tag, as_hashable, filter_ordered, filter_sorted, frozendict,
+    reuse_if_unchanged
+)
+from devito.types import Eq, Inc, ReduceMax, ReduceMin, ReduceMinMax
+
+__all__ = [
+    'ClusterizedEq',
+    'DummyEq',
+    'LoweredEq',
+    'OpInc',
+    'OpMax',
+    'OpMin',
+    'OpMinMax',
+    'identity_mapper',
+]
+
+
+class IREq(sympy.Eq, Pickable):
+
+    __rargs__ = ('lhs', 'rhs')
+    __rkwargs__ = ('ispace', 'conditionals', 'implicit_dims', 'operation')
+
+    def _hashable_content(self):
+        return (super()._hashable_content() +
+                tuple(as_hashable(getattr(self, i)) for i in self.__rkwargs__))
+
+    @property
+    def is_Scalar(self):
+        return self.lhs.is_Symbol
+
+    is_scalar = is_Scalar
+
+    @property
+    def ispace(self):
+        return self._ispace
+
+    @cached_property
+    def dimensions(self):
+        return set(self.ispace.dimensions)
+
+    @cached_property
+    def local_sums(self):
+        """The local sums in dependency order, with nested sums first."""
+        return tuple(filter_ordered(search(self, LocalSum, mode='all')))
+
+    @property
+    def implicit_dims(self):
+        return self._implicit_dims
+
+    @cached_property
+    def conditionals(self):
+        return self._conditionals or frozendict()
+
+    @property
+    def directions(self):
+        return self.ispace.directions
+
+    @property
+    def dtype(self):
+        return self.lhs.dtype
+
+    @property
+    def state(self):
+        return {i: getattr(self, i) for i in self.__rkwargs__}
+
+    @property
+    def operation(self):
+        return self._operation
+
+    @property
+    def is_Reduction(self):
+        return self.operation in (OpInc, OpMin, OpMax, OpMinMax)
+
+    @property
+    def is_Increment(self):
+        return self.operation is OpInc
+
+    @cached_property
+    def writes(self):
+        from devito.symbolics.queries import q_routine
+
+        terminals = set(retrieve_accesses(self.lhs))
+        if q_routine(self.rhs):
+            with suppress(AttributeError):
+                # Everything except: foreign routines, such as `cos` or `sin` etc.
+                terminals.update(self.rhs.writes)
+
+        return tuple(terminals)
+
+    @cached_property
+    def reads_explicit(self):
+        terminals = set(retrieve_accesses(self.rhs, deep=True))
+        with suppress(AttributeError):
+            terminals.update(retrieve_accesses(self.lhs.indices))
+
+        return tuple(terminals)
+
+    @cached_property
+    def reads_conditional(self):
+        accesses = []
+        for v in self.conditionals.values():
+            accesses.extend(retrieve_accesses(v))
+
+        return tuple(accesses)
+
+    @cached_property
+    def reads(self):
+        return tuple(set(self.reads_explicit) | set(self.reads_conditional))
+
+    @cached_property
+    def _read_functions(self):
+        found = []
+        for i in self.reads:
+            with suppress(AttributeError):
+                i = i.function
+            found.append(i)
+        return tuple(filter_sorted(found))
+
+    @cached_property
+    def _write_functions(self):
+        found = []
+        for i in self.writes:
+            with suppress(AttributeError):
+                i = i.function
+            found.append(i)
+        return tuple(filter_sorted(found))
+
+    @cached_property
+    def read_functions(self):
+        return tuple(i for i in self._read_functions if i.is_Input)
+
+    @cached_property
+    def write_functions(self):
+        return tuple(i for i in self._write_functions if i.is_Input)
+
+    @cached_property
+    def read_functions_relaxed(self):
+        return tuple(i for i in self._read_functions
+                     if i.is_Input or i.is_AbstractFunction)
+
+    @cached_property
+    def write_functions_relaxed(self):
+        return tuple(i for i in self._write_functions
+                     if i.is_Input or i.is_AbstractFunction)
+
+    def apply(self, func):
+        """
+        Apply a callable to `self` and each expr-like attribute carried by `self`,
+        thus triggering a reconstruction.
+        """
+        args = [func(self.lhs), func(self.rhs)]
+        kwargs = dict(self.state)
+
+        conditionals = {k: func(v) for k, v in self.conditionals.items()}
+        kwargs['conditionals'] = frozendict(conditionals)
+
+        return self.func(*args, **kwargs)
+
+    def __repr__(self):
+        if not self.is_Reduction:
+            return super().__repr__()
+        elif self.operation is OpInc:
+            return f'Inc({self.lhs}, {self.rhs})'
+        else:
+            return f'Eq({self.lhs}, {self.operation}({self.rhs}))'
+
+    __str__ = __repr__
+
+    # Pickling support
+    __reduce_ex__ = Pickable.__reduce_ex__
+
+
+class Operation(Tag):
+
+    """
+    Special operation performed by an Eq.
+    """
+
+    @classmethod
+    def detect(cls, expr):
+        reduction_mapper = {
+            Inc: OpInc,
+            ReduceMax: OpMax,
+            ReduceMin: OpMin,
+            ReduceMinMax: OpMinMax
+        }
+        try:
+            return reduction_mapper[type(expr)]
+        except KeyError:
+            pass
+
+        # NOTE: in the future we might want to track down other kinds
+        # of operations here (e.g., memcpy). However, we don't care for
+        # now, since they would remain unexploited inside the compiler
+
+        return None
+
+
+OpInc = Operation('+')
+OpMax = Operation('max')
+OpMin = Operation('min')
+OpMinMax = Operation('minmax')
+
+
+identity_mapper = {
+    np.int32: {OpInc: sympy.S.Zero,
+               OpMax: limits_mapper[np.int32].min,
+               OpMin: limits_mapper[np.int32].max},
+    np.int64: {OpInc: sympy.S.Zero,
+               OpMax: limits_mapper[np.int64].min,
+               OpMin: limits_mapper[np.int64].max},
+    np.float32: {OpInc: sympy.S.Zero,
+                 OpMax: limits_mapper[np.float32].min,
+                 OpMin: limits_mapper[np.float32].max},
+    np.float64: {OpInc: sympy.S.Zero,
+                 OpMax: limits_mapper[np.float64].min,
+                 OpMin: limits_mapper[np.float64].max},
+}
+
+
+class LoweredEq(IREq):
+
+    """
+    LoweredEq(devito.Eq)
+    LoweredEq(devito.LoweredEq, **kwargs)
+    LoweredEq(lhs, rhs, **kwargs)
+
+    A SymPy equation enriched with metadata such as an IterationSpace.
+
+    When created as `LoweredEq(devito.Eq)`, the iteration space is automatically
+    derived from analysis of `expr`.
+
+    When created as `LoweredEq(devito.LoweredEq, **kwargs)`, the keyword
+    arguments can be anything that appears in `LoweredEq.__rkwargs__`
+    (e.g., ispace).
+
+    When created as `LoweredEq(lhs, rhs, **kwargs)`, *all* keywords in
+    `LoweredEq.__rkwargs__` must appear in `kwargs`.
+    """
+
+    __rkwargs__ = IREq.__rkwargs__
+
+    def __new__(cls, *args, **kwargs):
+        if len(args) == 1 and isinstance(args[0], LoweredEq):
+            # origin: LoweredEq(devito.LoweredEq, **kwargs)
+            input_expr = args[0]
+            expr = sympy.Eq.__new__(cls, *input_expr.args, evaluate=False)
+            for i in cls.__rkwargs__:
+                setattr(expr, f'_{i}', kwargs.get(i) or getattr(input_expr, i))
+            return expr
+        elif len(args) == 1 and isinstance(args[0], Eq):
+            # origin: LoweredEq(devito.Eq)
+            input_expr = expr = args[0]
+        elif len(args) == 2:
+            expr = sympy.Eq.__new__(cls, *args, evaluate=False)
+            for i in cls.__rkwargs__:
+                setattr(expr, f'_{i}', kwargs.pop(i))
+            return expr
+        else:
+            raise ValueError(f"Cannot construct LoweredEq from args={str(args)} "
+                             f"and kwargs={str(kwargs)}")
+
+        # Well-defined dimension ordering
+        ordering = dimension_sort(expr)
+
+        # Analyze the expression
+        accesses = detect_accesses(expr)
+        dimensions = Stencil.union(*accesses.values())
+        bound = bounded(expr)
+
+        # Separate out the SubIterators from the main iteration Dimensions, that
+        # is those which define an actual iteration space
+        iterators = {}
+        for d in dimensions:
+            if d in bound:
+                # Local sum dimensions belong to the sum's own iteration space
+                continue
+            if d.is_SubIterator:
+                iterators.setdefault(d.root, set()).add(d)
+            elif d.is_Conditional:
+                # Use `parent`, and `root`, because a ConditionalDimension may
+                # have a SubDimension as parent
+                iterators.setdefault(d.parent, set())
+            elif not d.is_Stencil:
+                iterators.setdefault(d, set())
+
+        # Construct the IterationSpace
+        intervals = IntervalGroup([Interval(d) for d in iterators],
+                                  relations=ordering.relations, mode='partial')
+        ispace = IterationSpace(intervals, iterators)
+
+        expr, conditionals = generate_conditionals(expr, input_expr, ordering)
+        # Lower all Differentiable operations into SymPy operations
+        rhs = diff2sympy(expr.rhs)
+
+        # Finally create the LoweredEq with all metadata attached
+        expr = super().__new__(cls, expr.lhs, rhs, evaluate=False)
+
+        expr._ispace = ispace
+        expr._conditionals = conditionals
+        expr._implicit_dims = input_expr.implicit_dims
+        expr._operation = Operation.detect(input_expr)
+
+        return expr
+
+    def xreplace(self, rules):
+        return LoweredEq(self.lhs.xreplace(rules), self.rhs.xreplace(rules), **self.state)
+
+    def func(self, *args):
+        return self._rebuild(*args, evaluate=False)
+
+
+class ClusterizedEq(IREq):
+
+    """
+    ClusterizedEq(devito.IREq, **kwargs)
+    ClusterizedEq(lhs, rhs, **kwargs)
+
+    A SymPy equation enriched with metadata such as an IterationSpace.
+
+    There are two main differences between a LoweredEq and a
+    ClusterizedEq:
+
+    * To construct a ClusterizedEq, the IterationSpace must be provided
+      by the caller, whie in a LoweredEq the IterationSpace is derived
+      by analysis of the input.
+    * A ClusterizedEq is "frozen", meaning that any call to e.g. `xreplace`
+      will not trigger re-evaluation (e.g., mathematical simplification)
+      of the expression.
+
+    These two properties make a ClusterizedEq suitable for use in a Cluster.
+    """
+
+    @reuse_if_unchanged('__rkwargs__')
+    def __new__(cls, *args, **kwargs):
+        if len(args) == 1:
+            # origin: ClusterizedEq(expr, **kwargs)
+            input_expr = args[0]
+            expr = sympy.Eq.__new__(cls, *input_expr.args, evaluate=False)
+            if isinstance(input_expr, IREq):
+                for i in cls.__rkwargs__:
+                    try:
+                        v = kwargs[i]
+                    except KeyError:
+                        v = getattr(input_expr, i, None)
+                    setattr(expr, f'_{i}', v)
+            else:
+                expr._ispace = kwargs['ispace']
+                expr._conditionals = kwargs.get('conditionals', {})
+                expr._implicit_dims = input_expr.implicit_dims
+                expr._operation = Operation.detect(input_expr)
+        elif len(args) == 2:
+            # origin: ClusterizedEq(lhs, rhs, **kwargs)
+            expr = sympy.Eq.__new__(cls, *args, evaluate=False)
+            for i in cls.__rkwargs__:
+                setattr(expr, f'_{i}', kwargs.pop(i))
+        else:
+            raise ValueError(f"Cannot construct ClusterizedEq from args={str(args)} "
+                             f"and kwargs={str(kwargs)}")
+
+        # Immutability (and thus hashability, etc)
+        expr._conditionals = frozendict(expr._conditionals)
+
+        return expr
+
+    func = IREq._rebuild
+
+
+class DummyEq(ClusterizedEq):
+
+    """
+    DummyEq(expr)
+    DummyEq(lhs, rhs)
+
+    A special ClusterizedEq with a void iteration space.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        if len(args) == 1:
+            input_expr = args[0]
+            assert isinstance(input_expr, Eq)
+            obj = LoweredEq(input_expr)
+        elif len(args) == 2:
+            obj = LoweredEq(Eq(*args, evaluate=False))
+        else:
+            raise ValueError(f"Cannot construct DummyEq from args={str(args)}")
+        return ClusterizedEq.__new__(cls, obj, ispace=obj.ispace)

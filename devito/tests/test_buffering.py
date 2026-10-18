@@ -1,0 +1,1181 @@
+import numpy as np
+import pytest
+from sympy import Not, Or
+
+from conftest import skipif
+from devito import (
+    CondEq, ConditionalDimension, Constant, CustomDimension, Dimension, Eq, Function,
+    Grid, Operator, SparseTimeFunction, SubDimension, SubDomain, TimeFunction,
+    configuration, switchconfig
+)
+from devito.arch.archinfo import AppleArm
+from devito.exceptions import CompilationError
+from devito.ir import (
+    Cluster, Conditional, FindNodes, FindSymbols, Interval, IterationSpace, lower_exprs,
+    retrieve_iteration_tree
+)
+from devito.passes.clusters.buffering import BufferDimension, expand_halo_transfers
+from devito.types import Array
+
+
+def test_read_write():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+
+    eqn = Eq(u.forward, u + 1)
+
+    op0 = Operator(eqn, opt='noop')
+    op1 = Operator(eqn, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+    assert buffers.pop().symbolic_shape[0] == 2
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1)
+
+    assert np.all(u.data == u1.data)
+
+
+def test_write_only():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+    time = grid.time_dim
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    eqns = [Eq(v.forward, v + 1, implicit_dims=time),
+            Eq(u, v)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1, v=v1)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize('forward', [False, True])
+def test_write_only_with_halo_source(forward):
+    """
+    A buffered save of a Function with a populated halo must preserve that halo.
+    """
+    nt = 5
+    grid = Grid(shape=(17, 17))
+    y = grid.dimensions[-1]
+
+    u = TimeFunction(name='u', grid=grid, space_order=8)
+    usave = TimeFunction(name='usave', grid=grid, space_order=8, save=nt)
+
+    k = CustomDimension(name='k', parent=y, symbolic_min=1,
+                        symbolic_max=4, symbolic_size=4)
+
+    eqns = [Eq(u.forward, u + 1),
+            Eq(u.forward._subs(y, -k), -u.forward._subs(y, k)),
+            Eq(usave, u.forward if forward else u)]
+
+    op = Operator(eqns, opt='buffering', name='save_halo')
+    op.apply(time_M=nt-2)
+
+    hx, hy = usave._size_halo.left[1:]
+    for t in range(nt-1):
+        assert np.all(usave.data[t] == t + forward)
+        actual = usave.data_with_halo[t, hx:hx + grid.shape[0], hy-4:hy]
+        assert np.all(actual == -(t + forward))
+
+
+@pytest.mark.parametrize('space_order, shift', [(0, 0), (8, -1), (8, 1), (10, 1)])
+@switchconfig(autopadding=False)
+def test_write_only_with_halo_source_bounds(space_order, shift):
+    grid = Grid(shape=(17, 17))
+    y = grid.dimensions[-1]
+
+    u = TimeFunction(name='u', grid=grid, space_order=8)
+    v = TimeFunction(name='v', grid=grid, space_order=space_order)
+    usave = TimeFunction(name='usave', grid=grid, space_order=8, save=5)
+
+    k = CustomDimension(name='k', parent=y, symbolic_min=1,
+                        symbolic_max=4, symbolic_size=4)
+
+    eqns = [Eq(u.forward, u + 1),
+            Eq(u.forward._subs(y, -k), -u.forward._subs(y, k)),
+            Eq(usave, u.forward + v.forward._subs(y, y + shift))]
+
+    if space_order == 10:
+        # A wider halo accommodates the shifted read
+        v.data_with_halo[:] = 2
+        op = Operator(eqns, opt='buffering', name='save_shifted_halo')
+        op.apply(time_M=3)
+        assert np.all(usave.data[3] == 6)
+        hx, hy = usave._size_halo.left[1:]
+        assert np.all(usave.data_with_halo[3, hx:hx + grid.shape[0], hy-4:hy] == -2)
+    else:
+        with pytest.raises(CompilationError, match='Insufficient halo for `v`'):
+            Operator(eqns, opt='buffering')
+
+
+@pytest.mark.parametrize('mixed', [False, True])
+def test_halo_transfers_non_time_dimension(mixed):
+    s = Dimension(name='s')
+    x = Dimension(name='x')
+    u = Function(name='u', dimensions=(s, x), shape=(5, 17),
+                 halo=((0, 0), (4, 4)))
+    usave = Function(name='usave', dimensions=(s, x), shape=(5, 17),
+                     halo=u.halo)
+    db = BufferDimension('db', 0, 0, 1, s)
+    b = Array(name='b', dimensions=(db, x), halo=usave.halo)
+    k = CustomDimension(name='k', parent=x, symbolic_min=1,
+                        symbolic_max=4, symbolic_size=4)
+
+    mirror = Cluster(lower_exprs(Eq(u[s+1, -k], -u[s+1, k])),
+                     IterationSpace([Interval(s), Interval(k)]))
+    eqns = [Eq(usave[s, x], u[s+1, x])]
+    if mixed:
+        eqns.append(Eq(u[s, x], 0))
+    save = Cluster(lower_exprs(eqns), IterationSpace([Interval(s), Interval(x)]))
+    mapper = {(usave, save.guards): b}
+
+    if mixed:
+        with pytest.raises(CompilationError, match='mixed Cluster'):
+            expand_halo_transfers([mirror, save], mapper)
+        return
+
+    clusters = expand_halo_transfers([mirror, save], mapper)
+
+    assert clusters[0] is mirror
+    assert clusters[1].ispace[x].offsets == (-4, 4)
+    # The streaming axis is not part of the halo footprint, even with a shifted read
+    assert clusters[1].ispace[s] == save.ispace[s]
+    assert clusters[1].exprs[0].args == save.exprs[0].args
+
+
+def test_read_only():
+    nt = 10
+    grid = Grid(shape=(2, 2))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.forward, v + u.backward + u + u.forward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_read_only_w_offset():
+    nt = 10
+    grid = Grid(shape=(2, 2))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.forward, v + u.backward + u + u.forward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    op0.apply(time_M=nt-2, time_m=4)
+    op1.apply(time_M=nt-2, time_m=4, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize('async_degree,expected_size', [(None, 3), (4, 4)])
+def test_read_only_backwards(async_degree, expected_size):
+    nt = 10
+    grid = Grid(shape=(2, 2))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.backward, v + u.backward + u + u.forward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt=('buffering',
+                              {'buf-async-degree': async_degree}))
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+    assert buffers.pop().symbolic_shape[0] == expected_size
+
+    op0.apply(time_m=1)
+    op1.apply(time_m=1, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_read_only_backwards_unstructured():
+    """
+    Instead of the class `time-1`, `time`, and `time+1`, here we access the
+    buffered Function via `time-2`, `time-1` and `time+2`.
+    """
+    nt = 10
+    grid = Grid(shape=(2, 2))
+
+    u = TimeFunction(name='u', grid=grid, save=nt, space_order=0)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.backward, v + u.backward.backward + u.backward + u.forward.forward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_m=2)
+    op1.apply(time_m=2, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize('async_degree', [1, 2, 4])
+@pytest.mark.parametrize('backward', [False, True],
+                         ids=['forward', 'backward'])
+def test_async_degree(async_degree, backward):
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+
+    lhs = u.backward if backward else u.forward
+    eqn = Eq(lhs, u + 1)
+
+    op0 = Operator(eqn, opt='noop')
+    op1 = Operator(eqn, opt=('buffering', {'buf-async-degree': async_degree}))
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    buffers = [i for i in FindSymbols().visit(op1)
+               if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+    assert buffers.pop().symbolic_shape[0] == max(2, async_degree)
+
+    kwargs = {'time_m': 1} if backward else {'time_M': nt - 2}
+    op0.apply(**kwargs)
+    op1.apply(u=u1, **kwargs)
+
+    assert np.all(u.data == u1.data)
+
+
+@pytest.mark.parametrize('backward,expected_bounds', [
+    pytest.param(False, (0, 8), id='forward'),
+    pytest.param(True, (1, 9), id='backward')
+])
+@pytest.mark.parametrize('async_degree', [0, 1, 4, 16])
+def test_async_degree_read_only(backward, expected_bounds, async_degree):
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    u.data[:] = np.arange(nt).reshape(nt, 1, 1)
+
+    lhs = v.backward if backward else v.forward
+    eqn = Eq(lhs, v + u)
+
+    op0 = Operator(eqn, opt='noop', name='op0')
+    op1 = Operator(eqn, opt=('buffering',
+                             {'buf-async-degree': async_degree}), name='op1')
+
+    buffers = [i for i in FindSymbols().visit(op1)
+               if i.is_Array and i._mem_heap]
+    assert len(buffers) == int(async_degree != 0)
+    if async_degree:
+        assert buffers[0].symbolic_shape[0] == async_degree
+
+    for op in [op0, op1]:
+        args = op.arguments()
+        assert (args['time_m'], args['time_M']) == expected_bounds
+
+    # Default bounds, either endpoint, a partial ring, and an empty interval
+    time_m, time_M = expected_bounds
+    for kwargs in [{}, {'time_m': time_m, 'time_M': time_m},
+                   {'time_m': time_M, 'time_M': time_M},
+                   {'time_m': 3, 'time_M': 4}, {'time_m': 1, 'time_M': 0}]:
+        v.data[:] = 0
+        v1.data[:] = 0
+        op0.apply(**kwargs)
+        op1.apply(v=v1, **kwargs)
+
+        assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize('async_degree', [None, 4])
+def test_two_homogeneous_buffers(async_degree):
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid, save=nt)
+    v1 = TimeFunction(name='v', grid=grid, save=nt)
+
+    eqns = [Eq(u.forward, u + v + u.backward + v.backward + 1.),
+            Eq(v.forward, u + v + u.backward + v.backward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt=('buffering',
+                              {'buf-async-degree': async_degree}))
+    op2 = Operator(eqns, opt=('buffering', 'fuse',
+                              {'buf-async-degree': async_degree}))
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 5
+    assert len(retrieve_iteration_tree(op2)) == 3
+    buffers = [i for i in FindSymbols().visit(op1.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 2
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1, v=v1)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+    u1.data[:] = 0
+    v1.data[:] = 0
+    op2.apply(time_M=nt-2, u=u1, v=v1)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+
+@pytest.mark.parametrize('async_degree', [None, 4])
+def test_two_heterogeneous_buffers(async_degree):
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid, save=nt)
+    v1 = TimeFunction(name='v', grid=grid, save=nt)
+
+    for i in range(nt):
+        u.data[i, :] = i
+        u1.data[i, :] = i
+
+    eqns = [Eq(u.forward, u + v + 1),
+            Eq(v.forward, u + v + v.backward)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt=('buffering',
+                              {'buf-async-degree': async_degree}))
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 5
+    buffers = [i for i in FindSymbols().visit(op1.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 2
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1, v=v1)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+
+def test_over_one_subdomain():
+
+    class sd0(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('middle', 3, 3), y: ('middle', 3, 3)}
+
+    s_d0 = sd0()
+    nt = 10
+    grid = Grid(shape=(10, 10), subdomains=(s_d0,))
+
+    u = TimeFunction(name="u", grid=grid, save=nt)
+    u1 = TimeFunction(name="u", grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    eqns = [Eq(v.forward, v + 1, subdomain=s_d0),
+            Eq(u, v, subdomain=s_d0)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1, v=v1)
+
+    assert np.all(u.data == u1.data)
+    assert np.all(v.data == v1.data)
+
+
+def test_over_one_subdomain_read_only():
+
+    class sd0(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('middle', 3, 3), y: ('middle', 3, 3)}
+
+    s_d0 = sd0()
+    nt = 10
+    grid = Grid(shape=(10, 10), subdomains=(s_d0,))
+
+    u = TimeFunction(name="u", grid=grid, save=nt)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.forward, v + u + u.forward + 2., subdomain=s_d0)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_over_two_subdomains_illegal():
+    """
+    Cannot use buffering when:
+
+        * an Eq writes to `f` using one set of SubDimensions
+        * another Eq reads from `f` through a different set of SubDimensions
+
+    as the second Eq may want to read unwritten memory (i.e., zero-valued)
+    in the buffered Function, while with buffering it might end up reading values
+    written in a previous iteration, thus breaking a storage-related RAW dependence.
+    """
+
+    class sd0(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('middle', 3, 3), y: ('middle', 3, 3)}
+
+    class sd1(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('middle', 2, 2), y: ('middle', 2, 2)}
+
+    s_d0 = sd0()
+    s_d1 = sd1()
+    nt = 10
+    grid = Grid(shape=(10, 10), subdomains=(s_d0, s_d1))
+
+    u = TimeFunction(name="u", grid=grid, save=nt)
+
+    eqns = [Eq(u.forward, u + 1, subdomain=s_d0),
+            Eq(u.forward, u.forward + 1, subdomain=s_d1)]
+
+    with pytest.raises(CompilationError):
+        Operator(eqns, opt='buffering')
+
+
+@pytest.mark.xfail(reason="Cannot deal with non-overlapping SubDimensions yet")
+def test_over_two_subdomains():
+
+    class sd0(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('left', 2), y: ('left', 2)}
+
+    class sd1(SubDomain):
+        name = 'd0'
+
+        def define(self, dimensions):
+            x, y = dimensions
+            return {x: ('middle', 2, 2), y: ('middle', 2, 2)}
+
+    s_d0 = sd0()
+    s_d1 = sd1()
+    nt = 10
+    grid = Grid(shape=(10, 10), subdomains=(s_d0, s_d1))
+
+    u = TimeFunction(name="u", grid=grid, save=nt)
+    u1 = TimeFunction(name="u", grid=grid, save=nt)
+
+    eqns = [Eq(u.forward, u + 1, subdomain=s_d0),
+            Eq(u.forward, u.forward + u + 1, subdomain=s_d1)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1)
+
+    assert np.all(u.data == u1.data)
+
+
+def test_subdims():
+    nt = 10
+    grid = Grid(shape=(10, 10, 10))
+    x, y, z = grid.dimensions
+    xi = SubDimension.middle(name='xi', parent=x, thickness_left=2, thickness_right=2)
+    yi = SubDimension.middle(name='yi', parent=y, thickness_left=2, thickness_right=2)
+    zi = SubDimension.middle(name='zi', parent=z, thickness_left=2, thickness_right=2)
+
+    u = TimeFunction(name='u', grid=grid, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, save=nt)
+
+    eqn = Eq(u.forward, u + 1).xreplace({x: xi, y: yi, z: zi})
+
+    op0 = Operator(eqn, opt='noop')
+    op1 = Operator(eqn, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    assert len([i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]) == 1
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1)
+
+    assert np.all(u.data == u1.data)
+
+
+def test_conddim_backwards():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+    time_dim = grid.time_dim
+    x, y = grid.dimensions
+
+    factor = Constant(name='factor', value=2, dtype=np.int32)
+    time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+    u = TimeFunction(name='u', grid=grid, time_order=0, save=nt, time_dim=time_sub,
+                     space_order=0)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(u.save):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.backward, v.backward + v + u + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_m=1, time_M=9)
+    op1.apply(time_m=1, time_M=9, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_conddim_backwards_multi_slots():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+    time_dim = grid.time_dim
+    x, y = grid.dimensions
+
+    factor = Constant(name='factor', value=2, dtype=np.int32)
+    time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+    u = TimeFunction(name='u', grid=grid, time_order=0, save=nt, time_dim=time_sub,
+                     space_order=0)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(u.save):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.backward, v + u.backward + u + u.forward + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_m=1, time_M=9)
+    op1.apply(time_m=1, time_M=9, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_conddim_backwards_unstructured():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+    time_dim = grid.time_dim
+    x, y = grid.dimensions
+
+    factor = Constant(name='factor', value=2, dtype=np.int32)
+    time_sub = ConditionalDimension(name="time_sub", parent=time_dim, factor=factor)
+
+    u = TimeFunction(name='u', grid=grid, space_order=0, time_order=0, save=nt,
+                     time_dim=time_sub)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+
+    for i in range(u.save):
+        u.data[i, :] = i
+
+    ub = u[time_sub - 1, x, y]
+    ubb = u[time_sub - 2, x, y]
+    uff = u[time_sub + 2, x, y]
+
+    eqns = [Eq(v.backward, v.backward + v + ubb + ub + uff + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    # Note 1: cannot use time_m<4 or time_M>14 or there would be OOB accesses
+    # due to `ubb` and `uff`, which read two steps away from the current point,
+    # while `u` has in total `nt=10` entries (so last one has index 9). In
+    # particular, at `time_M=14` we will read from `uff = u[time/factor + 2] =
+    # u[14/2+2] = u[9]`, which is the last available entry in `u`. Likewise,
+    # at `time_m=4` we will read from `ubb = u[time/factor - 2`] = u[4/2 - 2] =
+    # u[0]`, which is clearly the last accessible entry in `u` while iterating
+    # in the backward direction
+    # Note 2: Given `factor=2`, we always write to `v` when `time % 2 == 0`, which
+    # means that we always write to `v[t1] = v[(time+1)%2] = v[1]`, while `v[0]`
+    # remains zero-valued. So the fact that the Eq is also reading from `v` is
+    # only relevant to induce the backward iteration direction
+    op0.apply(time_m=4, time_M=14)
+    op1.apply(time_m=4, time_M=14, v=v1)
+
+    assert np.all(v.data == v1.data)
+
+
+def test_conddim_w_shifting():
+    nt = 50
+    grid = Grid(shape=(5, 5))
+    time = grid.time_dim
+
+    factor = Constant(name='factor', value=5, dtype=np.int32)
+    t_sub = ConditionalDimension('t_sub', parent=time, factor=factor)
+    save_shift = Constant(name='save_shift', dtype=np.int32)
+
+    u = TimeFunction(name='u', grid=grid, time_order=0)
+    u1 = TimeFunction(name='u', grid=grid, time_order=0)
+    usave = TimeFunction(name='usave', grid=grid, space_order=0, time_order=0,
+                         save=(int(nt//factor.data)), time_dim=t_sub)
+
+    for i in range(usave.save):
+        usave.data[i, :] = i
+
+    eqns = Eq(u.forward, u + usave.subs(t_sub, t_sub - save_shift))
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 4
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    # From time_m=15 to time_M=35 with a factor=5 -- it means that, thanks
+    # to t_sub, we enter the Eq exactly (35-15)/5 + 1 = 5 times. We set
+    # save_shift=1 so instead of accessing the range usave[15/5:35/5+1],
+    # we rather access the range usave[15/5-1:35:5], which means accessing
+    # the usave values 2, 3, 4, 5, 6.
+    op0.apply(time_m=15, time_M=35, save_shift=1)
+    op1.apply(time_m=15, time_M=35, save_shift=1, u=u1)
+    assert np.allclose(u.data, 20)
+    assert np.all(u.data == u1.data)
+
+    # Again, but with a different shift
+    op1.apply(time_m=15, time_M=35, save_shift=-2, u=u1)
+    assert np.allclose(u1.data, 20 + 35)
+
+
+def test_multi_access():
+    nt = 10
+    grid = Grid(shape=(2, 2))
+
+    u = TimeFunction(name='u', grid=grid, save=nt, space_order=0)
+    v = TimeFunction(name='v', grid=grid)
+    v1 = TimeFunction(name='v', grid=grid)
+    w = TimeFunction(name='w', grid=grid)
+    w1 = TimeFunction(name='w', grid=grid)
+
+    for i in range(nt):
+        u.data[i, :] = i
+
+    eqns = [Eq(v.forward, v + u.forward + 1.),
+            Eq(w.forward, w + u + 1.)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op1)) == 3
+    buffers = [i for i in FindSymbols().visit(op1) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, v=v1, w=w1)
+
+    assert np.all(v.data == v1.data)
+    assert np.all(w.data == w1.data)
+
+
+def test_stencil_w_interp():
+    """
+    MFE for a buffered Function accessed both by a stencil Cluster, which
+    iterates the spatial Dimensions with a definite direction, and indirectly
+    via interpolation, which does not iterate them at all. The inferred buffer
+    IterationSpaces differ in the spatial directions only (`x++` vs `x*`),
+    which must not prevent buffering.
+    """
+    grid = Grid(shape=(8, 8))
+    nt = 6
+
+    u = TimeFunction(name='u', grid=grid, space_order=2, save=nt)
+    u1 = TimeFunction(name='u', grid=grid, space_order=2, save=nt)
+
+    rec = SparseTimeFunction(name='rec', grid=grid, npoint=1, nt=nt)
+    rec.coordinates.data[:] = .5
+    rec1 = SparseTimeFunction(name='rec', grid=grid, npoint=1, nt=nt,
+                              coordinates=rec.coordinates.data)
+
+    eqns0 = [Eq(u.forward, u + u.laplace + 1.)] + rec.interpolate(expr=u)
+    eqns1 = [Eq(u1.forward, u1 + u1.laplace + 1.)] + rec1.interpolate(expr=u1)
+
+    op0 = Operator(eqns0, opt='noop')
+    op1 = Operator(eqns1, opt='buffering')
+
+    # Check generated code -- expecting one buffer for `u`
+    buffers = [i for i in FindSymbols().visit(op1.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2)
+
+    assert np.allclose(u.data, u1.data, rtol=1e-6)
+    assert np.allclose(rec.data, rec1.data, rtol=1e-6)
+
+
+def test_issue_1901():
+    grid = Grid(shape=(2, 2))
+    time = grid.time_dim
+    x, y = grid.dimensions
+
+    usave = TimeFunction(name='usave', grid=grid, save=10, space_order=0)
+    v = TimeFunction(name='v', grid=grid)
+
+    eq = [Eq(v[time, x, y], usave)]
+
+    op = Operator(eq, opt='buffering')
+
+    trees = retrieve_iteration_tree(op)
+    assert len(trees) == 3
+    assert trees[2].root.dim is time
+    assert not trees[2].root.is_Parallel
+    assert trees[2].root.is_Sequential  # Obv
+
+
+def test_everything():
+    nt = 50
+    grid = Grid(shape=(6, 6))
+    x, y = grid.dimensions
+    time = grid.time_dim
+    xi = SubDimension.middle(name='xi', parent=x, thickness_left=2, thickness_right=2)
+    yi = SubDimension.middle(name='yi', parent=y, thickness_left=2, thickness_right=2)
+
+    factor = Constant(name='factor', value=5, dtype=np.int32)
+    t_sub = ConditionalDimension('t_sub', parent=time, factor=factor)
+    save_shift = Constant(name='save_shift', dtype=np.int32)
+
+    u = TimeFunction(name='u', grid=grid, time_order=0)
+    u1 = TimeFunction(name='u', grid=grid, time_order=0)
+    va = TimeFunction(name='va', grid=grid, time_order=0,
+                      save=(int(nt//factor.data)), time_dim=t_sub)
+    vb = TimeFunction(name='vb', grid=grid, time_order=0,
+                      save=(int(nt//factor.data)), time_dim=t_sub)
+
+    for i in range(va.save):
+        va.data[i, :] = i
+        vb.data[i, :] = i*2 - 1
+
+    vas = va.subs(t_sub, t_sub - save_shift)
+    vasb = va.subs(t_sub, t_sub - 1 - save_shift)
+    vasf = va.subs(t_sub, t_sub + 1 - save_shift)
+
+    eqns = [Eq(u.forward, u + (vasb + vas + vasf)*2. + vb)]
+
+    eqns = [e.xreplace({x: xi, y: yi}) for e in eqns]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    # Check generated code
+    assert len([i for i in FindSymbols().visit(op1.body) if i.is_Array
+                and i._mem_heap]) == 2
+
+    op0.apply(time_m=15, time_M=35, save_shift=0)
+    op1.apply(time_m=15, time_M=35, save_shift=0, u=u1)
+
+    assert np.all(u.data == u1.data)
+
+
+@pytest.mark.parametrize('subdomain', ['domain', 'interior'])
+@switchconfig(safe_math=True, condition=isinstance(configuration['platform'], AppleArm))
+def test_stencil_issue_1915(subdomain):
+    nt = 5
+    grid = Grid(shape=(6, 6))
+
+    u = TimeFunction(name='u', grid=grid, space_order=4)
+    u1 = TimeFunction(name='u', grid=grid, space_order=4)
+    usave = TimeFunction(name='usave', grid=grid, space_order=4, save=nt)
+    usave1 = TimeFunction(name='usave', grid=grid, space_order=4, save=nt)
+
+    subdomain = grid.subdomains[subdomain]
+
+    eqns = [Eq(u.forward, u.dx + 1, subdomain=subdomain),
+            Eq(usave, u.forward, subdomain=subdomain)]
+
+    op0 = Operator(eqns, opt='noop')
+    op1 = Operator(eqns, opt='buffering')
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1, usave=usave1)
+
+    assert np.all(u.data == u1.data)
+
+
+@skipif('cpu64-icc')
+@pytest.mark.parametrize('subdomain', ['domain', 'interior'])
+def test_stencil_issue_1915_v2(subdomain):
+    """
+    Follow up of test_stencil_issue_1915, now with reverse propagation.
+    """
+    nt = 5
+    grid = Grid(shape=(6, 6))
+    time = grid.time_dim
+    x, y = grid.dimensions
+
+    u = TimeFunction(name='u', grid=grid, space_order=4)
+    u1 = TimeFunction(name='u', grid=grid, space_order=4)
+
+    usave = TimeFunction(name='usave', grid=grid, space_order=4, save=nt)
+
+    for i in range(nt):
+        usave.data[i] = i
+
+    subdomain = grid.subdomains[subdomain]
+
+    eqn = Eq(u, usave[time, x, y-1] + usave + usave[time, x, y+1], subdomain=subdomain)
+
+    op0 = Operator(eqn, opt='noop')
+    op1 = Operator(eqn, opt='buffering')
+
+    op0.apply(time_M=nt-2)
+    op1.apply(time_M=nt-2, u=u1)
+
+    assert np.all(u.data == u1.data)
+
+
+def test_buffer_reuse():
+    nt = 10
+    grid = Grid(shape=(4, 4))
+
+    u = TimeFunction(name='u', grid=grid)
+    usave = TimeFunction(name='usave', grid=grid, save=nt)
+    vsave = TimeFunction(name='vsave', grid=grid, save=nt)
+
+    eqns = [Eq(u.forward, u + 1),
+            Eq(usave, u.forward),
+            Eq(vsave, u.forward + 1)]
+
+    op = Operator(eqns, opt=('buffering', {'buf-reuse': True}))
+
+    # Check generated code
+    assert len(retrieve_iteration_tree(op)) == 5
+    buffers = [i for i in FindSymbols().visit(op) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op.apply(time_M=nt-1)
+
+    assert all(np.all(usave.data[i-1] == i) for i in range(1, nt + 1))
+    assert all(np.all(vsave.data[i-1] == i + 1) for i in range(1, nt + 1))
+
+
+def test_multi_cond_v0():
+    grid = Grid((3, 3))
+    nt = 5
+
+    x, y = grid.dimensions
+
+    factor = 2
+    ntmod = (nt - 1) * factor + 1
+
+    ct1 = ConditionalDimension(name="ct1", parent=grid.time_dim,
+                               factor=factor)
+    ctend = ConditionalDimension(name="ctend", parent=grid.time_dim,
+                                 condition=CondEq(grid.time_dim, ntmod - 2),
+                                 relation='strict')
+
+    f = TimeFunction(grid=grid, name='f', time_order=0,
+                     space_order=0, save=nt, time_dim=ct1)
+    T = TimeFunction(grid=grid, name='T', time_order=0, space_order=0)
+
+    eqs = [Eq(T, grid.time_dim)]
+    # This saves
+    # - All subsampled times since ct1 is the dimension of f
+    eqs.append(Eq(f, T))
+    # - The last time step (ntmod - 2) through ctend (since it's set as ct1 or ctend)
+    eqs.append(Eq(f, T, implicit_dims=ctend))
+
+    # run operator with buffering
+    op = Operator(eqs, opt='buffering')
+    op.apply(time_m=0, time_M=ntmod-2)
+
+    for i in range(nt-1):
+        assert np.allclose(f.data[i], i*2)
+    assert np.allclose(f.data[nt-1], ntmod - 2)
+
+
+def test_multi_cond_v1():
+    grid = Grid((3, 3))
+    nt = 5
+
+    x, y = grid.dimensions
+
+    factor = 2
+    ntmod = (nt - 1) * factor + 1
+
+    ct1 = ConditionalDimension(name="ct1", parent=grid.time_dim,
+                               factor=factor, relation=Or,
+                               condition=CondEq(grid.time_dim, ntmod - 2))
+
+    f = TimeFunction(grid=grid, name='f', time_order=0,
+                     space_order=0, save=nt, time_dim=ct1)
+    T = TimeFunction(grid=grid, name='T', time_order=0, space_order=0)
+
+    eqs = [Eq(T, grid.time_dim)]
+    # This saves
+    # - All subsampled times since ct1 is the dimension of f with factor 2
+    # - The last time step (ntmod - 2) since ct1 also has the condition for ntmod - 2
+    eqs.append(Eq(f, T))
+
+    # run operator with buffering
+    op = Operator(eqs, opt='buffering')
+    op.apply(time_m=0, time_M=ntmod-2)
+
+    for i in range(nt-1):
+        assert np.allclose(f.data[i], i*2)
+    assert np.allclose(f.data[nt-1], ntmod - 2)
+
+
+def test_deferred_guard_aliasing():
+    """
+    A write to `f` guarded by a Dimension foreign to `f`. The guard does not
+    constrain `f`'s stepping Dimension, so no dedicated buffer can be created;
+    the write accesses `f[time]`, which fits the main buffer's slots, hence it
+    must alias it rather than get a buffer of its own.
+    """
+    grid = Grid(shape=(5, 5))
+    nt = 5
+
+    f = TimeFunction(name='f', grid=grid, time_order=0, space_order=0, save=nt)
+    T = TimeFunction(name='T', grid=grid, time_order=0, space_order=0)
+
+    e = Dimension('e')
+    g = Function(name='g', dimensions=(e,), shape=(3,), dtype=np.float32)
+    g.data[:] = 100.
+    ce = ConditionalDimension(name='ce', parent=e, condition=CondEq(e, 1))
+
+    eqs = [Eq(T, grid.time_dim),
+           Eq(f, T),
+           Eq(f, g + T, implicit_dims=ce)]
+
+    op = Operator(eqs, opt='buffering')
+
+    # The guarded write accesses `f[time]`, covered by the main buffer,
+    # so it gets aliased to it and no extra buffer is created
+    buffers = [i for i in FindSymbols().visit(op.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op.apply(time_m=0, time_M=nt-1)
+    assert np.allclose(f.data[:, 1, 1], 100. + np.arange(nt))
+
+
+def test_deferred_guard_writeonly():
+    """
+    Like `test_deferred_guard_aliasing`, but the guarded write accesses
+    `f[time+1]`. Since `f` is only written to, the guarded write still shares
+    the main buffer: each slot is copied back right after being written, so
+    the two writes cannot collide.
+    """
+    grid = Grid(shape=(5, 5))
+    nt = 5
+
+    f = TimeFunction(name='f', grid=grid, time_order=0, space_order=0, save=nt)
+    T = TimeFunction(name='T', grid=grid, time_order=0, space_order=0)
+
+    e = Dimension('e')
+    g = Function(name='g', dimensions=(e,), shape=(3,), dtype=np.float32)
+    g.data[:] = 100.
+    ce = ConditionalDimension(name='ce', parent=e, condition=CondEq(e, 1))
+
+    eqs = [Eq(T, grid.time_dim),
+           Eq(f, T),
+           Eq(f.forward, g + T, implicit_dims=ce)]
+
+    op = Operator(eqs, opt='buffering')
+
+    # A single buffer for the write-only `f`
+    buffers = [i for i in FindSymbols().visit(op.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op.apply(time_m=0, time_M=nt-2)
+    # `f[t]` is overwritten by the main stream at iteration `t` for t < nt-1,
+    # while `f[nt-1]` retains the value of the guarded write at `t = nt-2`
+    expected = np.append(np.arange(nt-1), 100. + nt - 2)
+    assert np.allclose(f.data[:, 1, 1], expected)
+
+
+@pytest.mark.parametrize("factor", [1, 2, 3])
+def test_buffering_same_slot_single_copyback(factor):
+    """
+    A subsampled save and a CondEq save into the same Function land on the same
+    slot when the CondEq point is on the subsampled grid. Only one copy-back,
+    carrying the last value, must then be performed: the copy-back of the first
+    write is skipped whenever the second one overwrites its slot. Asynchronous
+    copy-backs (e.g., to disk) would otherwise write the slot concurrently.
+    """
+    grid = Grid((4, 4))
+
+    nt = 5
+    ntmod = (nt - 1) * factor + 1
+    last = ntmod - 2
+    on_grid = last % factor == 0
+    nsave = nt - 1 if on_grid else nt
+
+    ct0 = ConditionalDimension(name="ct0", parent=grid.time_dim, factor=factor,
+                               relation=Or)
+    ctend = ConditionalDimension(name="ctend", parent=grid.time_dim,
+                                 condition=CondEq(grid.time_dim, last),
+                                 relation='strict')
+    f = TimeFunction(grid=grid, name='f', time_order=0, space_order=0,
+                     time_dim=ct0, save=nsave)
+    T = TimeFunction(grid=grid, name='T', time_order=0, space_order=0)
+
+    eqs = [Eq(T, grid.time_dim), Eq(f, T), Eq(f, T+1, implicit_dims=ctend)]
+
+    op = Operator(eqs, opt='buffering')
+
+    # The first copy-back is skipped when the second one targets the same slot
+    skips = [i for i in FindNodes(Conditional).visit(op) if i.condition.has(Not)]
+    assert len(skips) == 1
+
+    op.apply(time_m=0, time_M=last)
+
+    expected = factor * np.arange(nsave)
+    expected[-1] = last + 1
+    assert np.allclose(f.data[:, 1, 1], expected)
+
+
+@pytest.mark.parametrize("factor", [1, 2, 3])
+def test_buffering_multi_cond(factor):
+    grid = Grid((16, 16))
+
+    nt = 5
+    ntmod = (nt - 1) * factor + 1
+
+    ct0 = ConditionalDimension(name="ct0", parent=grid.time_dim, factor=factor,
+                               relation=Or)
+    f = TimeFunction(grid=grid, name='f', time_order=0, space_order=0,
+                     time_dim=ct0, save=nt)
+    T = TimeFunction(grid=grid, name='T', time_order=0, space_order=0)
+
+    eqs = []
+    eqs.append(Eq(T, grid.time_dim))
+
+    # conditional dimension for the last sample in the operator
+    ctend = ConditionalDimension(name="ctend", parent=grid.time_dim,
+                                 condition=CondEq(grid.time_dim, ntmod - 2),
+                                 relation='strict')
+
+    eqs.append(Eq(f, T))  # this to save times from 0 to nt - 2
+    # this to save the last time sample nt - 1
+    eqs.append(Eq(f, T+1, implicit_dims=ctend))
+
+    # run operator with serialization
+    op = Operator(eqs, opt='buffering')
+
+    # Both writes to `f` share a single buffer
+    buffers = [i for i in FindSymbols().visit(op.body) if i.is_Array and i._mem_heap]
+    assert len(buffers) == 1
+
+    op.apply(time_m=0, time_M=ntmod-2)
+
+    # Now run backward as well with buffering
+
+    f_all = TimeFunction(grid=grid, name='f_all', time_order=0,
+                         space_order=0, time_dim=ct0, save=nt)
+
+    eq_all = [Eq(f_all, f)]
+    eq_all.append(Eq(f_all, f, implicit_dims=ctend))
+    op_all = Operator(eq_all, opt='buffering')
+    op_all.apply(time_m=0, time_M=ntmod-2)
+    expected = factor * np.arange(nt)
+    if (ntmod - 2) % factor == 0:
+        # The last sample is on the subsampled grid, hence no extra slot
+        expected[-2:] = [ntmod - 1, 0]
+    assert np.allclose(f_all.data[:, 11, 11], expected)
