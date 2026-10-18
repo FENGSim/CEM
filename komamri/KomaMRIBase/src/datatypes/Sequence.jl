@@ -1,0 +1,917 @@
+"""
+    seq = Sequence()
+    seq = Sequence(sys::Scanner)
+    seq = Sequence(GR)
+    seq = Sequence(GR, RF)
+    seq = Sequence(GR, RF, ADC)
+    seq = Sequence(GR, RF, ADC, DUR)
+    seq = Sequence(GR::Array{<:Grad,1})
+    seq = Sequence(GR::Array{<:Grad,1}, RF::Array{<:RF,1})
+    seq = Sequence(GR::Array{<:Grad,1}, RF::Array{<:RF,1}, A::ADC, DUR, DEF)
+
+The Sequence struct. It contains events of an MRI sequence. Most field names (except for the
+DEF field) consist of matrices or vectors, where each column index represents a sequence
+block.
+
+# Arguments
+- `GR`: (`::Matrix{Grad}`) gradient matrix. Rows for x-y-z amplitudes and columns are for blocks
+- `RF`: (`::Matrix{RF}`) RF matrix. The 1 row is for the coil and columns are for blocks
+- `ADC`: (`::Array{ADC,1}`) ADC block vector
+- `DUR`: (`::Vector`, `[s]`) duration block vector
+- `DEF`: (`::Dict{String, Any}`) dictionary with sequence definitions. Pulseq
+    raster and hardware-check metadata use Pulseq-style keys such as
+    `"BlockDurationRaster"`, `"GradientRasterTime"`, `"MaxGrad"`, and `"MaxSlew"`.
+
+# Returns
+- `seq`: (`::Sequence`) Sequence struct
+"""
+mutable struct Sequence{GT,RT,AT,DT,XT,DF}
+    GR::GT #Sequence in (X, Y and Z) and time
+    RF::RT #RF pulses in coil and time
+    ADC::AT #ADC in time
+    DUR::DT #Duration of each block, this enables delays after RF pulses to satisfy ring-down times
+    EXT::XT
+    DEF::DF #Dictionary with information relevant to the reconstructor
+    Sequence(GR, RF, ADC, DUR, EXT, DEF) = begin
+        @assert size(GR, 2) == size(RF, 2) == length(ADC) == length(DUR) "The number of Gradient, RF, ADC, DUR and EXT objects must be the same."
+        GR = _concrete_event_array(_ensure_gradient_axes(GR))
+        RF = _concrete_event_array(RF)
+        new{typeof(GR),typeof(RF),typeof(ADC),typeof(DUR),typeof(EXT),typeof(DEF)}(
+            GR,
+            RF,
+            ADC,
+            DUR,
+            EXT,
+            DEF,
+        )
+    end
+end
+
+function _ensure_gradient_axes(GR)
+    nchannels = size(GR, 1)
+    missing_axes = 3 - nchannels
+    missing_axes <= 0 && return GR
+    return vcat(GR, [0.0 .* GR[1:1, :] for _ in 1:missing_axes]...)
+end
+
+_empty_extensions_per_block(nblocks) = [Extension[] for _ = 1:nblocks]
+
+_small_union_eltype(xs...) = _small_union_eltype_of_arrays(xs)
+
+function _small_union_eltype_of_arrays(xs)
+    types = Type[]
+    eltypes = Type[]
+    for x in xs
+        T = eltype(x)
+        push!(eltypes, T)
+        if isconcretetype(T)
+            T in types || push!(types, T)
+        elseif T isa Union
+            for U in Base.uniontypes(T)
+                U in types || push!(types, U)
+            end
+        else
+            for value in x
+                T = typeof(value)
+                T in types || push!(types, T)
+            end
+        end
+    end
+    return isempty(types) ? reduce(typejoin, eltypes) :
+        length(types) == 1 ? only(types) : Core.apply_type(Union, types...)
+end
+
+_concrete_event_array(x) = x
+_concrete_event_array(x::AbstractArray{Grad}) = _concrete_event_array_copy(x)
+_concrete_event_array(x::AbstractArray{RF}) = _concrete_event_array_copy(x)
+
+function _concrete_event_array_copy(x)
+    T = _small_union_eltype(x)
+    T === eltype(x) && return x
+    out = similar(x, T)
+    out .= x
+    return out
+end
+
+const PULSEQ_RASTER_DEFINITION_KEYS = (
+    "BlockDurationRaster",
+    "GradientRasterTime",
+    "RadiofrequencyRasterTime",
+    "AdcRasterTime",
+)
+const PULSEQ_HW_DEFINITION_KEYS = (
+    "B0",
+    "MaxB1",
+    "MaxGrad",
+    "MaxSlew",
+    "RfRingdownTime",
+    "RfDeadTime",
+    "AdcDeadTime",
+)
+
+const DEFAULT_SEQUENCE_DEFINITIONS = Dict{String,Any}(
+    "BlockDurationRaster" => 10e-6,
+    "GradientRasterTime" => 10e-6,
+    "RadiofrequencyRasterTime" => 1e-6,
+    "AdcRasterTime" => 100e-9,
+    "B0" => 1.5,
+    "MaxB1" => Inf,
+    "MaxGrad" => Inf,
+    "MaxSlew" => Inf,
+    "RfRingdownTime" => 0.0,
+    "RfDeadTime" => 0.0,
+    "AdcDeadTime" => 0.0,
+)
+
+_sequence_def(sys::Scanner) = Dict{String,Any}(
+    "BlockDurationRaster" => sys.limits.DUR_Δt,
+    "GradientRasterTime" => sys.limits.GR_Δt,
+    "RadiofrequencyRasterTime" => sys.limits.RF_Δt,
+    "AdcRasterTime" => sys.limits.ADC_Δt,
+    "B0" => sys.limits.B0,
+    "MaxB1" => sys.limits.B1,
+    "MaxGrad" => sys.limits.Gmax,
+    "MaxSlew" => sys.limits.Smax,
+    "RfRingdownTime" => sys.limits.RF_ring_down_time,
+    "RfDeadTime" => sys.limits.RF_dead_time,
+    "AdcDeadTime" => sys.limits.ADC_dead_time,
+)
+
+_default_sequence_def() = copy(DEFAULT_SEQUENCE_DEFINITIONS)
+_sequence_def_from_pulseq(def) = merge(_default_sequence_def(), deepcopy(def))
+
+function _merge_sequence_def!(dest, src)
+    for (key, value) in src
+        haskey(dest, key) || (dest[key] = deepcopy(value))
+    end
+    return dest
+end
+
+function _sequence_scanner_from_def(def)
+    default = DEFAULT_SEQUENCE_DEFINITIONS
+    return Scanner(
+        limits=HardwareLimits(
+            B0=get(def, "B0", default["B0"]),
+            B1=get(def, "MaxB1", default["MaxB1"]),
+            Gmax=get(def, "MaxGrad", default["MaxGrad"]),
+            Smax=get(def, "MaxSlew", default["MaxSlew"]),
+            ADC_Δt=get(def, "AdcRasterTime", default["AdcRasterTime"]),
+            DUR_Δt=get(def, "BlockDurationRaster", default["BlockDurationRaster"]),
+            GR_Δt=get(def, "GradientRasterTime", default["GradientRasterTime"]),
+            RF_Δt=get(def, "RadiofrequencyRasterTime", default["RadiofrequencyRasterTime"]),
+            RF_ring_down_time=get(def, "RfRingdownTime", default["RfRingdownTime"]),
+            RF_dead_time=get(def, "RfDeadTime", default["RfDeadTime"]),
+            ADC_dead_time=get(def, "AdcDeadTime", default["AdcDeadTime"]),
+        ),
+    )
+end
+
+# Main Constructors
+function Sequence(seqs::AbstractVector{<:Sequence})
+    isempty(seqs) && return Sequence()
+    nblocks = sum(length, seqs)
+    nblocks == 0 && return Sequence()
+    i0 = findfirst(s -> length(s) > 0, seqs)
+    nGR, nRF = size(seqs[i0].GR, 1), size(seqs[i0].RF, 1)
+    @assert all(s -> length(s) == 0 || (size(s.GR, 1) == nGR && size(s.RF, 1) == nRF), seqs) "All sequences must have the same number of Gradient and RF channels."
+    GR = Matrix{_small_union_eltype_of_arrays(s.GR for s in seqs if length(s) > 0)}(undef, nGR, nblocks)
+    RF = Matrix{_small_union_eltype_of_arrays(s.RF for s in seqs if length(s) > 0)}(undef, nRF, nblocks)
+    ADC = Vector{_small_union_eltype_of_arrays(s.ADC for s in seqs if length(s) > 0)}(undef, nblocks)
+    DUR = Vector{Float64}(undef, nblocks)
+    EXT = Vector{Vector{Extension}}(undef, nblocks)
+    DEF = deepcopy(seqs[i0].DEF)
+    j = 1
+    for s in seqs
+        n = length(s)
+        n == 0 && continue
+        for k in eachindex(s.DUR)
+            for ax in axes(s.GR, 1)
+                GR[ax, j] = copy(s.GR[ax, k])
+            end
+            for coil in axes(s.RF, 1)
+                RF[coil, j] = copy(s.RF[coil, k])
+            end
+            ADC[j] = copy(s.ADC[k])
+            DUR[j] = s.DUR[k]
+            EXT[j] = deepcopy(s.EXT[k])
+            j += 1
+        end
+        s === seqs[i0] || _merge_sequence_def!(DEF, s.DEF)
+    end
+    return Sequence(GR, RF, ADC, DUR, EXT, DEF)
+end
+
+function Sequence(GR)
+    rf = reshape([RF(0.0, 0.0) for i in 1:size(GR, 2)], 1, :)
+    adc = [ADC(0, 0.0) for _ = 1:size(GR, 2)]
+    ext = _empty_extensions_per_block(size(GR, 2))
+    return Sequence(GR, rf, adc, GR.dur, ext, _default_sequence_def())
+end
+function Sequence(GR, RF)
+    adc = [ADC(0, 0.0) for _ in 1:size(GR, 2)]
+    dur = maximum([GR.dur RF.dur], dims=2)[:]
+    ext = _empty_extensions_per_block(size(GR, 2))
+    return Sequence(GR, RF, adc, dur, ext, _default_sequence_def())
+end
+function Sequence(GR, RF, ADC)
+    dur = maximum([GR.dur RF.dur ADC.dur], dims=2)[:]
+    ext = _empty_extensions_per_block(size(GR, 2))
+    return Sequence(GR, RF, ADC, dur, ext, _default_sequence_def())
+end
+function Sequence(GR, RF, ADC, DUR)
+    ext = _empty_extensions_per_block(size(GR, 2))
+    return Sequence(GR, RF, ADC, DUR, ext, _default_sequence_def())
+end
+function Sequence(GR, RF, ADC, DUR, EXT)
+    return Sequence(GR, RF, ADC, DUR, EXT, _default_sequence_def())
+end
+
+# Other constructors
+Sequence(GR::AbstractVector{<:Grad}) = Sequence(reshape(GR, 1, :))
+Sequence(GR::AbstractVector{<:Grad}, RF::AbstractVector{<:RF}) = Sequence(reshape(GR, :, 1), reshape(RF, 1, :), [ADC(0, 0.0) for _ in 1:size(GR, 2)])
+Sequence(GR::AbstractVector{<:Grad}, RF::AbstractVector{<:RF}, A::ADC, DUR, EXT, DEF) = Sequence(reshape(GR, :, 1), reshape(RF, 1, :), [A], [DUR], [EXT], DEF)
+Sequence() = Sequence(
+    Matrix{Grad}(undef, 3, 0),
+    Matrix{RF}(undef, 1, 0),
+    Vector{ADC}(undef, 0),
+    Vector{Float64}(undef, 0),
+    Vector{Vector{Extension}}(undef, 0),
+    _default_sequence_def(),
+)
+Sequence(sys::Scanner) = Sequence(
+    Matrix{Grad}(undef, 3, 0),
+    Matrix{RF}(undef, 1, 0),
+    Vector{ADC}(undef, 0),
+    Vector{Float64}(undef, 0),
+    Vector{Vector{Extension}}(undef, 0),
+    _sequence_def(sys),
+)
+
+"""
+    str = show(io::IO, s::Sequence)
+
+Displays information about the Sequence struct `s` in the julia REPL.
+
+# Arguments
+- `s`: (`::Sequence`) Sequence struct
+
+# Returns
+- `str` (`::String`) output string message
+"""
+Base.show(io::IO, s::Sequence) = begin
+    compact = get(io, :compact, false)
+    if length(s) > 0
+        if !compact
+            nGRs = sum(is_Gx_on.(s)) + sum(is_Gy_on.(s)) + sum(is_Gz_on.(s))
+            print(io, "Sequence[ τ = $(round(dur(s)*1e3;digits=3)) ms | blocks: $(length(s)) | ADC: $(sum(is_ADC_on.(s))) | GR: $nGRs | RF: $(sum(is_RF_on.(s))) | EXT: $(sum(isempty.(s.EXT) .== 0)) | DEF: $(length(s.DEF)) ]")
+        else
+            print(io, "Sequence[τ = $(round(dur(s)*1e3;digits=3)) ms]")
+        end
+    else
+        print(io, "Sequence[]")
+    end
+end
+
+#Sequence operations
+Base.length(x::Sequence) = length(x.DUR)
+Base.iterate(x::Sequence) = length(x) == 0 ? nothing : (view(x, 1), 2)
+Base.iterate(x::Sequence, i::Integer) = (i <= length(x)) ? (view(x, i), i+1) : nothing
+Base.view(x::Sequence, i::Integer) = (checkbounds(x.DUR, i); view(x, i:i))
+Base.view(x::Sequence, i::AbstractVector{Bool}) = any(i) ? view(x, findall(i)) : nothing
+Base.view(x::Sequence, i) = @views Sequence(x.GR[:,i], x.RF[:,i], x.ADC[i], x.DUR[i], x.EXT[i], x.DEF)
+Base.getindex(x::Sequence, i::UnitRange{Int}) = view(x, i)
+Base.getindex(x::Sequence, i::Int) = view(x, i)
+Base.getindex(x::Sequence, i::AbstractVector{Bool}) = view(x, i)
+Base.lastindex(x::Sequence) = length(x.DUR)
+Base.copy(x::Sequence) = Sequence(_deepcopy_fields(x)...)
+
+function _copy_events(x::AbstractArray{T}) where {T}
+    out = similar(x, T)
+    @inbounds for i in eachindex(x)
+        out[i] = copy(x[i])
+    end
+    return out
+end
+_copy_block_metadata(x) = deepcopy(x)
+_fits_eltype(::Type{T}, x) where {T} = all(value -> typeof(value) <: T, x)
+const _BlockEvent = Union{Grad,RF,ADC,Extension,Nothing}
+const _BlockEventTuple = Tuple{_BlockEvent,Vararg{_BlockEvent}}
+
+function _event_column(events::NTuple{N,T}) where {N,T}
+    out = Matrix{T}(undef, N, 1)
+    @inbounds for i in 1:N
+        out[i, 1] = events[i]
+    end
+    return out
+end
+
+function _event_column(events)
+    T = _small_union_eltype(events)
+    out = Matrix{T}(undef, length(events), 1)
+    @inbounds for i in eachindex(events)
+        out[i, 1] = events[i]
+    end
+    return out
+end
+
+function _event_vector(events::NTuple{N,T}) where {N,T}
+    out = Vector{T}(undef, N)
+    @inbounds for i in 1:N
+        out[i] = events[i]
+    end
+    return out
+end
+
+function _event_vector(events)
+    T = _small_union_eltype(events)
+    out = Vector{T}(undef, length(events))
+    @inbounds for i in eachindex(events)
+        out[i] = events[i]
+    end
+    return out
+end
+
+function _append_event_matrix!(x::Matrix, y::AbstractMatrix, ::Val{copy_new}=Val(true)) where {copy_new}
+    @assert size(x, 1) == size(y, 1) "Both sequences must have the same number of event channels."
+    n0 = size(x, 2)
+    n = size(y, 2)
+    out = if _fits_eltype(eltype(x), y)
+        reshape(resize!(vec(x), size(x, 1) * (n0 + n)), size(x, 1), n0 + n)
+    else
+        T = _small_union_eltype(x, y)
+        out = Matrix{T}(undef, size(x, 1), n0 + n)
+        @inbounds for j in axes(x, 2), i in axes(x, 1)
+            out[i, j] = x[i, j]
+        end
+        out
+    end
+    @inbounds for j in 1:n, i in axes(y, 1)
+        out[i, n0+j] = copy_new ? copy(y[i, j]) : y[i, j]
+    end
+    return out
+end
+
+function _append_event_vector!(x::Vector, y::AbstractVector, ::Val{copy_new}=Val(true)) where {copy_new}
+    n0 = length(x)
+    n = length(y)
+    out = if _fits_eltype(eltype(x), y)
+        resize!(x, n0 + n)
+    else
+        T = _small_union_eltype(x, y)
+        out = Vector{T}(undef, n0 + n)
+        @inbounds for j in eachindex(x)
+            out[j] = x[j]
+        end
+        out
+    end
+    @inbounds for j in 1:n
+        out[n0+j] = copy_new ? copy(y[j]) : y[j]
+    end
+    return out
+end
+
+function _append_metadata_vector!(x::Vector, y::AbstractVector, ::Val{copy_new}=Val(true)) where {copy_new}
+    n0 = length(x)
+    n = length(y)
+    resize!(x, n0 + n)
+    @inbounds for j in 1:n
+        x[n0+j] = copy_new ? deepcopy(y[j]) : y[j]
+    end
+    return x
+end
+
+# For freshly created sequences whose events are already owned by the caller.
+function _append_owned!(x::Sequence, y::Sequence)
+    length(y) == 0 && return x
+    x.GR = _append_event_matrix!(x.GR, y.GR, Val(false))
+    x.RF = _append_event_matrix!(x.RF, y.RF, Val(false))
+    x.ADC = _append_event_vector!(x.ADC, y.ADC, Val(false))
+    append!(x.DUR, y.DUR)
+    x.EXT = _append_metadata_vector!(x.EXT, y.EXT, Val(false))
+    _merge_sequence_def!(x.DEF, y.DEF)
+    return x
+end
+
+function Base.append!(x::Sequence, y::Sequence)
+    length(y) == 0 && return x
+    x.GR = _append_event_matrix!(x.GR, y.GR)
+    x.RF = _append_event_matrix!(x.RF, y.RF)
+    x.ADC = _append_event_vector!(x.ADC, y.ADC)
+    append!(x.DUR, y.DUR)
+    x.EXT = _append_metadata_vector!(x.EXT, y.EXT)
+    _merge_sequence_def!(x.DEF, y.DEF)
+    return x
+end
+function Base.append!(x::Sequence, y::Sequence, ys::Sequence...)
+    append!(x, y)
+    for z in ys
+        append!(x, z)
+    end
+    return x
+end
+Base.push!(x::Sequence, y::Sequence) = append!(x, y)
+
+_event_tuple(::Type{T}) where {T} = ()
+_event_tuple(::Type{T}, event::T, rest...) where {T} = (event, _event_tuple(T, rest...)...)
+_event_tuple(::Type{T}, event, rest...) where {T} = _event_tuple(T, rest...)
+_check_block_event(::_BlockEvent) = nothing
+_check_block_event(event) = error("Unsupported block event $(typeof(event)).")
+_block_duration(block_duration) = block_duration
+_block_duration(block_duration, event, events...) = _block_duration(_block_duration(block_duration, event), events...)
+_block_duration(block_duration, ::Nothing) = block_duration
+_block_duration(block_duration, event) = max(block_duration, dur(event))
+_block_duration_constraint() = nothing
+_block_duration_constraint(event) = nothing
+function _block_duration_constraint(event, events...)
+    T = _block_duration_constraint(event)
+    U = _block_duration_constraint(events...)
+    if !isnothing(T) && !isnothing(U)
+        error("Only one `Duration` can be added per block.")
+    end
+    return isnothing(T) ? U : T
+end
+function _set_block_duration!(seq, events...)
+    block_duration = _block_duration(seq.DUR[1], events...)
+    T = _block_duration_constraint(events...)
+    if isnothing(T)
+        seq.DUR[1] = block_duration
+    elseif block_duration > T && !isapprox(block_duration, T; rtol=0, atol=PULSEQ_TIME_TOL)
+        error("Block duration $(block_duration) s exceeds requested Duration($(T)) s.")
+    else
+        seq.DUR[1] = T
+    end
+    return seq
+end
+_axis_grad(::Nothing, ref::Nothing) = Grad(0.0, 0.0)
+_axis_grad(::Nothing, ref::Grad) = 0.0 * ref
+_axis_grad(gr::Grad, ref) = gr
+
+function _block_sequence(events; x=nothing, y=nothing, z=nothing)
+    foreach(_check_block_event, events)
+    grads = (x, y, z)
+    for (axis, gr) in zip((:x, :y, :z), grads)
+        (isnothing(gr) || gr isa Grad) || error("Expected `$axis` to be a Grad.")
+    end
+    rfs = _event_tuple(RF, events...)
+    adcs = _event_tuple(ADC, events...)
+    exts = _event_tuple(Extension, events...)
+    bare_grads = _event_tuple(Grad, events...)
+    if !isempty(bare_grads)
+        if all(isnothing, grads) && length(events) == 1 && length(bare_grads) == 1
+            grads = (only(bare_grads), y, z)
+        else
+            error("Pass gradients with `x=`, `y=`, or `z=` when combining them with other events.")
+        end
+    end
+
+    ref_gr = something(grads..., Grad(0.0, 0.0))
+    grs = (_axis_grad(grads[1], ref_gr), _axis_grad(grads[2], ref_gr), _axis_grad(grads[3], ref_gr))
+    rf = isempty(rfs) ? reshape([RF(0.0, 0.0)], 1, 1) : _event_column(rfs)
+    adc = isempty(adcs) ? [ADC(0, 0.0)] : length(adcs) == 1 ? _event_vector(adcs) : error("Only one ADC event can be added per block.")
+    seq = Sequence(_event_column(grs), rf, adc)
+    _set_block_duration!(seq, events...)
+    seq.EXT[1] = Extension[exts...]
+    return seq
+end
+
+"""
+    addblock!(seq, events...; x=nothing, y=nothing, z=nothing)
+
+Append one block to `seq`. RF, ADC, and extensions are positional. Gradients use
+`x=`, `y=`, or `z=`.
+"""
+function addblock!(seq::Sequence, events::_BlockEventTuple; x=nothing, y=nothing, z=nothing)
+    return append!(seq, _block_sequence(events; x, y, z))
+end
+function addblock!(seq::Sequence, events...; x=nothing, y=nothing, z=nothing)
+    return append!(seq, _block_sequence(events; x, y, z))
+end
+Base.push!(seq::Sequence, events...) = addblock!(seq, events...)
+
+#Arithmetic operations
++(x::Sequence, y::Sequence) = Sequence([x, y])
+-(x::Sequence, y::Sequence) = x + (-y)
+-(x::Sequence) = Sequence(Matrix{Grad}(-x.GR), _copy_events(x.RF), _copy_events(x.ADC), copy(x.DUR), _copy_block_metadata(x.EXT), deepcopy(x.DEF))
+*(α::Real, x::Sequence) = Sequence(Matrix{Grad}(α .* x.GR), _copy_events(x.RF), _copy_events(x.ADC), copy(x.DUR), _copy_block_metadata(x.EXT), deepcopy(x.DEF))
+*(α::Complex, x::Sequence) = Sequence(_copy_events(x.GR), Matrix{RF}(α .* x.RF), Vector{ADC}(α .* x.ADC), copy(x.DUR), _copy_block_metadata(x.EXT), deepcopy(x.DEF))
+function *(A::AbstractMatrix{<:Real}, x::Sequence)
+    GR = Matrix{Grad}(length(x) == 1 ? reshape(A * view(x.GR, :, 1), :, 1) : A * x.GR)
+    return Sequence(GR, _copy_events(x.RF), _copy_events(x.ADC), copy(x.DUR), _copy_block_metadata(x.EXT), deepcopy(x.DEF))
+end
+/(x::Sequence, α::Real) = Sequence(Matrix{Grad}(x.GR / α), _copy_events(x.RF), _copy_events(x.ADC), copy(x.DUR), _copy_block_metadata(x.EXT), deepcopy(x.DEF))
++(s::Sequence, events::_BlockEventTuple) = s + _block_sequence(events)
++(events::_BlockEventTuple, s::Sequence) = _block_sequence(events) + s
+#Grad operations
++(s::Sequence, g::Grad) = s + (g,)
++(g::Grad, s::Sequence) = (g,) + s
+#RF operations
++(s::Sequence, r::RF) = s + (r,)
++(r::RF, s::Sequence) = (r,) + s
+#ADC operations
++(s::Sequence, a::ADC) = s + (a,)
++(a::ADC, s::Sequence) = (a,) + s
+#Sequence object functions
+size(x::Sequence) = size(x.GR[1,:])
+
+Base.isapprox(x::Sequence, y::Sequence; kwargs...) =
+    field_isapprox(x.GR, y.GR; kwargs...) &&
+    field_isapprox(x.RF, y.RF; kwargs...) &&
+    field_isapprox(x.ADC, y.ADC; kwargs...) &&
+    field_isapprox(x.DUR, y.DUR; kwargs...) &&
+    field_isapprox(x.EXT, y.EXT; kwargs...)
+
+"""
+    y = is_ADC_on(x::Sequence)
+    y = is_ADC_on(x::Sequence, t::Union{Array{Float64,1}, Array{Float64,2}})
+
+Tells if the sequence `seq` has elements with ADC active, or active during time `t`.
+
+# Arguments
+- `x`: (`::Sequence`) sequence struct
+- `t`: (`::Union{Array{Float64,1}, Array{Float64,2}}`, `[s]`) time to check
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the ADC in the sequence is active
+"""
+is_ADC_on(x::Sequence) = any(is_ADC_on, x.ADC)
+function is_ADC_on(x::Sequence, t::AbstractVecOrMat)
+    T0 = get_block_start_times(x)
+    return any(i -> is_ADC_on(x.ADC[i]) && any(T0[i] + x.ADC[i].delay .<= t .< T0[i] + dur(x.ADC[i])), eachindex(x.DUR))
+end
+
+"""
+    y = is_RF_on(x::Sequence)
+    y = is_RF_on(x::Sequence, t::Vector{Float64})
+
+Tells if the sequence `seq` has elements with RF active, or active during time `t`.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+- `t`: (`::Vector{Float64}`, `[s]`) time to check
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the RF in the sequence is active
+"""
+is_RF_on(x::Sequence) = any(is_RF_on, x.RF)
+function is_RF_on(x::Sequence, t::AbstractVector)
+    T0 = get_block_start_times(x)
+    return any(eachindex(x.DUR)) do i
+        any(rf -> is_RF_on(rf) && any(T0[i] + rf.delay .<= t .<= T0[i] + dur(rf)), x.RF[:, i])
+    end
+end
+
+"""
+    y = is_GR_on(x::Sequence)
+
+Tells if the sequence `seq` has elements with GR active.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the GR in the sequence is active
+"""
+is_GR_on(x::Sequence) = any(is_GR_on, x.GR)
+
+"""
+    y = is_Gx_on(x::Sequence)
+
+Tells if the sequence `seq` has elements with GR active in x direction.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the GRx in the sequence is active
+"""
+is_Gx_on(x::Sequence) = any(is_GR_on, x.GR.x)
+
+"""
+    y = is_Gy_on(x::Sequence)
+
+Tells if the sequence `seq` has elements with GR active in y direction.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the GRy in the sequence is active
+"""
+is_Gy_on(x::Sequence) = any(is_GR_on, x.GR.y)
+
+"""
+    y = is_Gz_on(x::Sequence)
+
+Tells if the sequence `seq` has elements with GR active in z direction.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y`: (`::Bool`) boolean that tells whether or not the GRz in the sequence is active
+"""
+is_Gz_on(x::Sequence) = any(is_GR_on, x.GR.z)
+
+"""
+    y = is_Delay(x::Sequence)
+
+Tells if the sequence `seq` is a delay.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y::Bool`: boolean that tells whether or not the sequence is a delay
+"""
+is_Delay(x::Sequence) = !(is_GR_on(x) || is_RF_on(x) || is_ADC_on(x))
+
+"""
+    T = dur(x::Sequence)
+
+The total duration of the sequence in [s].
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `T`: (`::Real`, `[s]`) total duration of the sequence
+"""
+dur(x::Sequence) = sum(x.DUR)
+
+"""
+    T0 = get_block_start_times(seq::Sequence)
+
+Returns a vector containing the start times of blocks in a sequence. The initial time is
+always zero, and the final time corresponds to the duration of the sequence.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+
+# Returns
+- `T0`: (`::Vector`, `[s]`) start times of the blocks in a sequence
+"""
+get_block_start_times(seq::Sequence) = cumsum([0.0; seq.DUR], dims=1)
+
+"""
+    samples = get_samples(seq::Sequence, blocks=1:length(seq); freq_in_phase=false)
+
+Returns global event waveform samples for `rf`, `Δf`, `ψ`, `gx`, `gy`, `gz`, and `adc`.
+"""
+get_samples(seq::Sequence, block::Integer; kwargs...) = get_samples(seq, block:block; kwargs...)
+
+function get_samples(seq::Sequence, blocks; freq_in_phase=false)
+    blocks = collect(blocks)
+    T0 = get_block_start_times(seq)
+    block_tables = [
+        merge(
+            block_event_waveforms(seq, i; freq_in_phase),
+            (; ψ=event_samples(seq.RF[1, i], Val(:ψ))),
+        )
+        for i in blocks
+    ]
+    function sequence_samples(name)
+        samples = getproperty.(block_tables, name)
+        return (
+            t=reduce(vcat, [T0[i] .+ s.t for (i, s) in zip(blocks, samples)]),
+            A=reduce(vcat, [s.A for s in samples]),
+        )
+    end
+    names = (:rf, :Δf, :ψ, :gx, :gy, :gz, :adc)
+    return NamedTuple{names}(sequence_samples.(names))
+end
+get_samples(seq::Sequence; kwargs...) = get_samples(seq, 1:length(seq); kwargs...)
+
+wrap_to_pi(x) = mod(x + π, 2π) - π
+
+"""
+    Gx, Gy, Gz = get_grads(seq, t::Vector)
+    Gx, Gy, Gz = get_grads(seq, t::Matrix)
+
+Get the gradient array from sequence `seq` evaluated in time points `t`.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+- `t`: (`::Vector{Float64}` or `1-row ::Matrix{Float64}`, `[s]`) times to evaluate
+
+# Returns
+- `Gx`: (`Vector{Float64}` or `1-row ::Matrix{Float64}`, `[T]`) gradient vector values
+    in the x direction
+- `Gy`: (`Vector{Float64}` or `1-row ::Matrix{Float64}`, `[T]`) gradient vector values
+    in the y direction
+- `Gz`: (`Vector{Float64}` or `1-row ::Matrix{Float64}`, `[T]`) gradient vector values
+    in the z direction
+"""
+function get_grads(seq, t)
+    values = evaluate_sequence_at(seq, t)
+    return reshape(values.Gx, size(t)), reshape(values.Gy, size(t)), reshape(values.Gz, size(t))
+end
+
+"""
+    B1, Δf_rf, ψ  = get_rfs(seq::Sequence, t)
+
+Returns the RF pulses, delta frequency, and RF rotating-frame phase.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+- `t`: (`1-row ::Matrix{Float64}`, `[s]`) time points
+
+# Returns
+- `B1`: (`1-row ::Matrix{ComplexF64}`, `[T]`) vector of RF pulses
+- `Δf_rf`: (`1-row ::Matrix{Float64}`, `[Hz]`) delta frequency vector
+- `ψ`: (`1-row ::Matrix{Float64}`, `[rad]`) RF rotating-frame phase vector
+"""
+function get_rfs(seq, t)
+    values = evaluate_sequence_at(seq, t)
+    return reshape(values.B1, size(t)), reshape(values.Δf, size(t)), reshape(values.ψ, size(t))
+end
+
+"""
+    y = get_flip_angles(x::Sequence)
+
+Returns all the flip angles of the RF pulses in the sequence `x`.
+
+# Arguments
+- `x`: (`::Sequence`) Sequence struct
+
+# Returns
+- `y`: (`::Vector{Float64}`, `[deg]`) flip angles
+"""
+get_flip_angles(x::Sequence) = get_flip_angle.(x.RF)[:]
+
+"""
+    rf_idx, rf_type = get_RF_types(seq, t)
+
+Get RF centers and types. Useful for k-space calculations. Centers map to the nearest
+time sample, with ties resolved by the first sample in `t`.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+- `t`: (`::Vector{Float64}`, `[s]`) time values
+
+# Returns
+- `rf_idx`: (`::Vector{Int64}`) indices of the RF centers
+- `rf_types`: (`::Vector{RFUse}`) RF types
+"""
+function get_RF_types(seq, t)
+    T0 = get_block_start_times(seq)
+    order = issorted(t) ? eachindex(t) : sortperm(t)
+    sorted_t = view(t, order)
+    rf_idx   = Int[]
+    rf_types = RFUse[]
+    for i in eachindex(seq.DUR)
+        rf = seq.RF[1, i]
+        if is_RF_on(rf)
+            trf = T0[i] + rf.delay + rf.center
+            right = clamp(searchsortedfirst(sorted_t, trf), firstindex(t), lastindex(t))
+            left = searchsortedfirst(sorted_t, sorted_t[max(firstindex(t), right - 1)])
+            a, b = order[left], order[right]
+            nearest = (abs(trf - t[a]), a) <= (abs(trf - t[b]), b) ? a : b
+            push!(rf_idx, nearest)
+            push!(rf_types, rf.use)
+        end
+    end
+    return rf_idx, rf_types
+end
+
+@doc raw"""
+    Mk, Mk_adc = get_Mk(seq::Sequence, k; sampling_rule=MaxStepSizeRule(1, 5e-5))
+
+Computes the ``k``th-order moment of the Sequence `seq` given by the formula ``\int_0^T t^k G(t) dt``.
+RF centers are always included in the integration grid, even if `sampling_rule` omits
+`:rf_center`, so excitation and refocusing occur at their defined times.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+- `k`: (`::Integer`) order of the moment to be computed
+
+# Keywords
+- `sampling_rule`: controls how sequence waveforms are sampled
+
+# Returns
+- `Mk`: (`3-column ::Matrix{Real}`) ``k``th-order moment
+- `Mk_adc`: (`3-column ::Matrix{Real}`) ``k``th-order moment sampled at ADC times
+"""
+function get_Mk(seq::Sequence, k; sampling_rule=MaxStepSizeRule(1, 5e-5))
+    seqd = discretize(seq; sampling_rule=MomentSamplingRule(sampling_rule))
+    rf_idx, rf_types = get_RF_types(seq, seqd.t[1:end-1])
+    return get_Mk(seqd, k; rf_idx, rf_types)
+end
+
+"""
+Computes the k-space trajectory of the Sequence `seq`.
+Refer to [`get_Mk`](@ref) and [`get_M0`](@ref)
+"""
+get_kspace(seq::Sequence; kwargs...) = get_Mk(seq, 0; kwargs...)
+
+"""
+Computes the zero-order moment of the Sequence `seq`.
+Refer to [`get_Mk`](@ref) and [`get_kspace`](@ref)
+"""
+get_M0(seq::Sequence; kwargs...) = get_Mk(seq, 0; kwargs...)
+
+"""
+Computes the 1st-order moment of the Sequence `seq`.
+Refer to [`get_Mk`](@ref)
+"""
+get_M1(seq::Sequence; kwargs...) = get_Mk(seq, 1; kwargs...)
+
+"""
+Computes the 2nd-order moment of the Sequence `seq`.
+Refer to [`get_Mk`](@ref)
+"""
+get_M2(seq::Sequence; kwargs...) = get_Mk(seq, 2; kwargs...)
+
+"""
+	SR, SR_adc = get_slew_rate(seq::Sequence; sampling_rule=MaxStepSizeRule(1, 5e-5))
+
+Outputs the designed slew rate of the Sequence `seq`.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+
+# Keywords
+- `sampling_rule`: controls how sequence waveforms are sampled
+
+# Returns
+- `SR`: (`3-column ::Matrix{Float64}`) Slew rate
+- `SR_adc`: (`3-column ::Matrix{Float64}`) Slew rate sampled at ADC points
+"""
+get_slew_rate(seq::Sequence; sampling_rule=MaxStepSizeRule(1, 5e-5)) =
+    get_slew_rate(discretize(seq; sampling_rule))
+
+"""
+    EC, EC_adc = get_eddy_currents(seq::Sequence; sampling_rule=MaxStepSizeRule(1, 5e-5), λ=80e-3)
+
+Outputs the designed eddy currents of the Sequence `seq`.
+
+# Arguments
+- `seq`: (`::Sequence`) Sequence struct
+
+# Keywords
+- `sampling_rule`: controls how sequence waveforms are sampled
+- `λ`: (`::Float64`, `=80e-3`, `[s]`) eddy current decay constant time
+
+# Returns
+- `EC`: (`3-column ::Matrix{Float64}`) Eddy currents
+- `EC_adc`: (`3-column ::Matrix{Float64}`) Eddy currents sampled at ADC points
+"""
+get_eddy_currents(seq::Sequence; sampling_rule=MaxStepSizeRule(1, 5e-5), λ=80e-3) =
+    get_eddy_currents(discretize(seq; sampling_rule); λ)
+
+function get_labels(seq::Sequence, nBlocks::Int=length(seq.EXT))
+  if nBlocks > length(seq.EXT)
+    @warn "nBlocks = $nBlocks is greater than the number of blocks in the sequence. All labels will be filled."
+    nBlocks = length(seq.EXT)
+  end
+
+  labels = AdcLabels[]
+  label = AdcLabels()
+
+  for b = 1:nBlocks
+    for val in seq.EXT[b]
+      label = _update_label(label, val)
+    end
+    push!(labels,label)
+  end
+  return labels
+end
+
+_adc_label_name(::Extension) = nothing
+_adc_label_name(label::Union{LabelSet,LabelInc}) = Symbol(label.labelstring)
+_is_imaging_label(label) =
+  iszero(label.NAV) && iszero(label.NOISE) && (iszero(label.REF) || !iszero(label.IMA))
+
+"""
+    adc_label_context(seq)
+
+Return the accumulated Pulseq labels and block indices for ADC events in `seq`.
+`encoding_blocks` contains imaging ADCs when present, otherwise every ADC block;
+`label_names` records the labels explicitly used by the sequence.
+`encoding_label_names` includes names encountered through the last encoding ADC, including
+explicit zero values; labels first introduced afterward cannot describe those acquisitions.
+"""
+function adc_label_context(seq::Sequence)
+  labels = get_labels(seq)
+  adc_blocks = findall(is_ADC_on, seq.ADC)
+  imaging_blocks = filter(b -> _is_imaging_label(labels[b]), adc_blocks)
+  encoding_blocks = isempty(imaging_blocks) ? adc_blocks : imaging_blocks
+  label_names = Set(Iterators.filter(!isnothing,
+    (_adc_label_name(ext) for ext in Iterators.flatten(seq.EXT))))
+  last_encoding_block = isempty(encoding_blocks) ? 0 : last(encoding_blocks)
+  encoding_label_names = Set(Iterators.filter(!isnothing,
+    (_adc_label_name(ext) for ext in Iterators.flatten(@view(seq.EXT[1:last_encoding_block])))))
+  return (; labels, adc_blocks, imaging_blocks, encoding_blocks, label_names, encoding_label_names)
+end
+
+_update_label(label::AdcLabels, ::Extension) = label
+_update_label(label::AdcLabels, val::LabelSet) = _adc_label_with(label, Symbol(val.labelstring), val.labelvalue)
+function _update_label(label::AdcLabels, val::LabelInc)
+  label_symbol = Symbol(val.labelstring)
+  return _adc_label_with(label, label_symbol, getproperty(label, label_symbol) + val.labelvalue)
+end
+
+function Base.maximum(label::Vector{AdcLabels})
+	isempty(label) && throw(ArgumentError("collection must be non-empty"))
+	values = ntuple(i -> maximum(getfield(adc_label, i) for adc_label in label), Val(length(ADC_LABEL_NAMES)))
+	return AdcLabels(values...)
+end

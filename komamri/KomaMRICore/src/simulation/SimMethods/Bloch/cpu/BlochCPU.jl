@@ -1,0 +1,209 @@
+"""Stores preallocated structs for use in Bloch CPU run_spin_precession! and run_spin_excitation! functions."""
+struct BlochCPUPrealloc{
+    T,
+    MT<:Mag{T},
+    RV<:AbstractVector{T},
+    ST<:Spinor{T},
+    S,
+    P,
+    R,
+} <: PreallocResult{T}
+    M::MT
+    Bz_old::RV
+    Bz_new::RV
+    ϕ::RV
+    Rot::ST
+    ΔBz::RV
+    sens::S
+    coordinates::P
+    spin_reset::R
+end
+
+view_sens(sensitivities, _) = sensitivities
+view_sens(sensitivities::CoilSensitivities, i) = CoilSensitivities(
+    @view(sensitivities.values[i, :]),
+    sensitivities.interpolators,
+)
+
+Base.view(p::BlochCPUPrealloc, i::UnitRange) = begin
+    @views BlochCPUPrealloc(
+        p.M[i],
+        p.Bz_old[i],
+        p.Bz_new[i],
+        p.ϕ[i],
+        p.Rot[i],
+        p.ΔBz[i],
+        view_sens(p.sens, i),
+        view_motion_coordinates(p.coordinates, i),
+        view(p.spin_reset, i),
+    )
+end
+
+"""Preallocates arrays for use in run_spin_precession! and run_spin_excitation!."""
+function prealloc(
+    ::Bloch, backend::KA.CPU, obj, M,
+    max_block_length, _max_adc_samples, _groupsize, sys,
+)
+    T = eltype(obj.x)
+    sens = prealloc_sensitivities(sys.receiver, obj)
+    return BlochCPUPrealloc(
+        Mag(
+            similar(M.xy),
+            similar(M.z)
+        ),
+        zeros(T, size(obj.x)),
+        zeros(T, size(obj.x)),
+        zeros(T, size(obj.x)),
+        Spinor(
+            similar(M.xy),
+            similar(M.xy)
+        ),
+        obj.Δw ./ T(2π .* γ),
+        sens,
+        prealloc_motion_coordinates(obj.motion, backend, obj, max_block_length),
+        prealloc_spin_reset(obj.motion, backend, length(obj), max_block_length),
+    )
+end
+
+"""
+    run_spin_precession(obj, seq, Xt, sig, M, sim_method, backend, prealloc)
+
+Alternate implementation of the run_spin_precession! function in BlochSimpleSimulationMethod.jl 
+optimized for the CPU. Uses a loop to step through time instead of allocating a matrix of size 
+NSpins x seq.t. The Bz_old, Bz_new, ϕ, and Mxy arrays are pre-allocated in run_sim_time_iter! so 
+that they can be re-used from block to block.
+"""
+function run_spin_precession!(
+    p::Phantom{T},
+    seq::DiscreteSequence{T},
+    sig::AbstractArray{Complex{T}},
+    M::Mag{T},
+    sys,
+    sim_method::Bloch,
+    groupsize,
+    backend::KA.CPU,
+    prealloc::PreallocResult{T}
+) where {T<:Real}
+    #Rename arrays
+    Bz_old = prealloc.Bz_old
+    Bz_new = prealloc.Bz_new
+    ϕ = prealloc.ϕ
+    Mxy = prealloc.M.xy
+    ΔBz = prealloc.ΔBz
+    spin_reset = prealloc.spin_reset
+    #Initialize
+    fill!(ϕ, zero(T))
+    block_time = zero(T)
+    sample = 1
+    advance_spin_reset!(spin_reset, firstindex(seq.t))
+    x, y, z = spin_coordinates!(
+        prealloc.coordinates, p.motion, p.x, p.y, p.z, seq.t[1],
+    )
+    @. Bz_old = x * seq.Gx[1] + y * seq.Gy[1] + z * seq.Gz[1] + ΔBz
+    #Simulation
+    for i in eachindex(seq.Δt)
+        #Motion
+        x, y, z = spin_coordinates!(
+            prealloc.coordinates, p.motion, p.x, p.y, p.z, seq.t[i + 1],
+        )
+        #Effective Field
+        @. Bz_new = x * seq.Gx[i + 1] + y * seq.Gy[i + 1] + z * seq.Gz[i + 1] + ΔBz
+        #Rotation
+        @. ϕ += (Bz_old + Bz_new) * T(-π * γ) * seq.Δt[i]
+        block_time += seq.Δt[i]
+        advance_spin_reset!(spin_reset, i + 1)
+        #Acquired Signal
+        if seq.ADC[i + 1]
+            #Update signal
+            @. Mxy = exp(-block_time / p.T2) * M.xy * cis(ϕ)
+            outflow_spin_reset!(Mxy, spin_reset)
+            update_sensitivities!(prealloc.sens, sys.receiver, (x, y, z), p.motion)
+            acquire_signal!(
+                @view(sig[sample, :]), Mxy, prealloc.sens, (x, y, z),
+            )
+            sample += 1
+        end
+        #Update simulation state
+        Bz_old .= Bz_new
+    end
+    #Final Spin-State
+    @. M.xy = M.xy * exp(-block_time / p.T2) * cis(ϕ)
+    @. M.z = M.z * exp(-block_time / p.T1) + p.ρ * (T(1) - exp(-block_time / p.T1))
+    outflow_spin_reset!(M, spin_reset; replace_by=p.ρ)
+    return nothing
+end
+
+"""
+    run_spin_excitation!(obj, seq, sig, M, sim_method, backend, prealloc)
+
+Alternate implementation of the run_spin_excitation! function in BlochSimpleSimulationMethod.jl 
+optimized for the CPU. Uses preallocation for all arrays to reduce memory usage.
+"""
+function run_spin_excitation!(
+    p::Phantom{T},
+    seq::DiscreteSequence{T},
+    sig::AbstractArray{Complex{T}},
+    M::Mag{T},
+    sys,
+    sim_method::Bloch,
+    groupsize,
+    backend::KA.CPU,
+    prealloc::BlochCPUPrealloc
+) where {T<:Real}
+    #Rename arrays 
+    Bz = prealloc.Bz_old
+    B = prealloc.Bz_new
+    φ_half = prealloc.ϕ
+    α = prealloc.Rot.α
+    β = prealloc.Rot.β
+    ΔBz = prealloc.ΔBz
+    Maux_xy = prealloc.M.xy
+    Maux_z = prealloc.M.z
+    spin_reset = prealloc.spin_reset
+    #Initialize
+    sample = 1
+    advance_spin_reset!(spin_reset, firstindex(seq.t))
+    outflow_spin_reset!(M, spin_reset; replace_by=p.ρ)
+    # Rotating frame -> RF frame
+    ψ_start = seq.ψ[1]
+    if !iszero(ψ_start)
+        @. M.xy = M.xy * cis(-ψ_start)
+    end
+    #Simulation
+    for i in eachindex(seq.Δt)
+        #Motion
+        x, y, z = spin_coordinates!(
+            prealloc.coordinates, p.motion, p.x, p.y, p.z, seq.t[i],
+        )
+        #Effective field
+        @. Bz = (seq.Gx[i] * x + seq.Gy[i] * y + seq.Gz[i] * z) + ΔBz - seq.Δf[i] / T(γ) # ΔB_0 = (B_0 - ω_rf/γ), Need to add a component here to model scanner's dB0(x,y,z)
+        @. B = sqrt(abs2(seq.B1[i]) + Bz^2)
+        #Spinor Rotation
+        @. φ_half = T(-π * γ) * (B * seq.Δt[i]) # TODO: Use trapezoidal integration here (?),  this is just Forward Euler
+        @. α = cos(φ_half)
+        @. B = sin(φ_half) / (B + (B == 0) * eps(T))
+        @. α -= Complex{T}(im) * Bz * B
+        @. β = -Complex{T}(im) * seq.B1[i] * B
+        mul!(Spinor(α, β), M, Maux_xy, Maux_z)
+        #Relaxation
+        @. M.xy = M.xy * exp(-seq.Δt[i] / p.T2)
+        @. M.z = M.z * exp(-seq.Δt[i] / p.T1) + p.ρ * (T(1) - exp(-seq.Δt[i] / p.T1))
+        advance_spin_reset!(spin_reset, i + 1)
+        outflow_spin_reset!(M, spin_reset; replace_by=p.ρ)
+        #Acquire signal
+        if seq.ADC[i + 1] # ADC at the end of the time step
+            coords = spin_coordinates!(
+                prealloc.coordinates, p.motion, p.x, p.y, p.z, seq.t[i + 1],
+            )
+            update_sensitivities!(prealloc.sens, sys.receiver, coords, p.motion)
+            acquire_signal!(@view(sig[sample, :]), M.xy, prealloc.sens, coords)
+            sample += 1
+        end
+    end
+    # RF frame -> Rotating frame
+    ψ_end = seq.ψ[end]
+    if !iszero(ψ_end)
+        @. M.xy = M.xy * cis(ψ_end)
+    end
+    return nothing
+end

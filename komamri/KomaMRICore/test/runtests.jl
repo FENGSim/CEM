@@ -1,0 +1,1204 @@
+using TestItems, TestItemRunner
+
+### NOTE: by default, tests are run on the CPU with the number of threads set to
+#   Threads.nthreads(). To run on a specific GPU backend, add the name of the
+#   backend package ("AMDGPU", "CUDA", "Metal", or "oneAPI") to the test/Project.toml
+#   file in KomaMRICore and pass the name as a test argument.
+#
+#   Example:
+#
+#   import Pkg
+#   Pkg.test("KomaMRICore"; test_args=["CUDA"])
+#
+#   To run on the cpu with a specific number of threads, pass the number of threads
+#   as a julia argument.
+#
+#   Example:
+#
+#   import Pkg
+#   Pkg.test("KomaMRICore"; julia_args=`--threads=4`)
+#
+#   For changing the default backend used for testing,
+#   modify the [preferences.KomaMRICore] section in the test/Project.toml:
+#
+#     [preferences.KomaMRICore]
+#     test_backend = "CPU"
+#
+#   For the backend preference to take effect, you need to:
+#   - REPL testing: No action needed. `] test` should pick up the preference right away.
+#   - VSCode testing: You need to restart VSCode.
+#
+#   Sadly, LocalPreferences.toml are not picked up by VScode (that could be .gitignore'd),
+#   so we had put them into the test/Project.toml.
+#
+###
+
+#Environment variable set by CI
+const CI    = get(ENV, "CI", nothing)
+const group = get(ENV, "TEST_GROUP", :core) |> Symbol
+
+@run_package_tests filter=ti->(group in ti.tags)&&(isnothing(CI) || :skipci ∉ ti.tags) #verbose=true
+
+@testitem "simulation-method sampling rule default" tags=[:core, :nomotion] begin
+    struct RuleDefaultMethod <: KomaMRICore.SimulationMethod end
+    struct RuleDefaultTestRule <: SamplingRule end
+
+    KomaMRICore.default_sampling_rule(::RuleDefaultMethod, sim_params) = RuleDefaultTestRule()
+
+    sim_params = KomaMRICore.default_sim_params(Dict{String,Any}("sim_method" => RuleDefaultMethod()))
+    @test !haskey(sim_params, "sampling_rule")
+    rule = KomaMRICore.simulation_sampling_rule(sim_params["sim_method"], sim_params)
+    @test rule isa KomaMRICore.IntegrationNodeSamplingRule
+    @test rule.rule isa RuleDefaultTestRule
+    @test KomaMRICore.integration_nodes(BlochMagnusConst1()) == (0,)
+    @test KomaMRICore.integration_nodes(BlochMagnusLin2()) == (0, 1)
+    @test KomaMRICore.integration_nodes(BlochMagnusMid2()) == (1//2,)
+    @test KomaMRICore.integration_nodes(BlochMagnusLinComm2()) == (0, 1)
+    @test KomaMRICore.integration_nodes(BlochMagnusQuad4()) == (0, 1//2, 1)
+    @test KomaMRICore.eval_intervals_per_step(BlochMagnusConst1()) == 1
+    @test KomaMRICore.eval_intervals_per_step(BlochMagnusMid2()) == 2
+    @test KomaMRICore.eval_intervals_per_step(BlochMagnusQuad4()) == 2
+    @test KomaMRICore.eval_intervals_per_step(BlochMagnusGL4()) == 3
+
+    override = MaxStepSizeRule(2e-3, 3e-5)
+    sim_params = KomaMRICore.default_sim_params(Dict{String,Any}(
+        "sim_method" => RuleDefaultMethod(),
+        "sampling_rule" => override,
+    ))
+    @test sim_params["sampling_rule"] === override
+    rule = KomaMRICore.simulation_sampling_rule(sim_params["sim_method"], sim_params)
+    @test rule.rule === override
+
+    sim_params = KomaMRICore.default_sim_params(Dict{String,Any}("sim_method" => BlochMagnusQuad4()))
+    sim_params["Δt_rf"] = 2.5e-4
+    rule = KomaMRICore.simulation_sampling_rule(sim_params["sim_method"], sim_params)
+    @test rule.rule.Δt_rf == 2.5e-4
+
+    sim_params["preserve_samples"] = ()
+    rule = KomaMRICore.simulation_sampling_rule(sim_params["sim_method"], sim_params)
+    @test KomaMRIBase.preserved_samples(rule) == ()
+
+    # Simulation defaults retain RF centers; opting out also disables their refinement anchors.
+    rf_duration = 2.0^-10
+    rf_center = 3rf_duration / 8
+    rf_seq = Sequence()
+    @addblock rf_seq += RF(1e-6, rf_duration, 0.0, 0.0; center=rf_center)
+    for method in (Bloch(), BlochMagnusMid2())
+        params = KomaMRICore.default_sim_params(Dict{String,Any}("Δt_rf" => rf_duration / 2))
+        center_rule = KomaMRICore.simulation_sampling_rule(method, params)
+        @test rf_center in discretize(rf_seq; sampling_rule=center_rule).t
+        params["preserve_samples"] = (:gradients,)
+        center_rule = KomaMRICore.simulation_sampling_rule(method, params)
+        @test rf_center ∉ discretize(rf_seq; sampling_rule=center_rule).t
+    end
+
+    delays = Sequence()
+    delays += Delay(1e-3)
+    delays += Delay(1e-3)
+    base_seqd = discretize(delays; sampling_rule=MaxStepSizeRule(Inf, Inf))
+    @test base_seqd.Δt ≈ [2e-3]
+
+    method_rule = KomaMRICore.simulation_sampling_rule(BlochMagnusQuad4(), Dict("Δt" => Inf, "Δt_rf" => Inf))
+    method_seqd = discretize(delays; sampling_rule=method_rule)
+    @test method_seqd.t ≈ [0.0, 2e-3]
+    @test method_seqd.Δt ≈ [2e-3]
+end
+
+@testitem "BlochMagnusQuad4 midpoint sampling" tags=[:core, :nomotion] begin
+    # Quadratic RF intervals are represented as start, true midpoint, and stop rows.
+    seq = Sequence()
+    @addblock seq += RF([1.0, 2.0, 4.0] .* 1e-6, 1e-3, [0.0, 500.0, 1000.0])
+    rule = KomaMRICore.simulation_sampling_rule(BlochMagnusQuad4(), Dict("Δt" => Inf, "Δt_rf" => 2.5e-4))
+    seqd = discretize(seq; motion=NoMotion(), sampling_rule=rule)
+
+    let i = firstindex(seqd.Δt)
+        while i <= lastindex(seqd.Δt)
+            if seqd.excitation_bool[i] && seqd.Δt[i] > 0
+                midpoint = i + 1
+                stop = i + 2
+                @test midpoint <= lastindex(seqd.Δt)
+                @test stop <= lastindex(seqd.t)
+                @test seqd.excitation_bool[midpoint]
+                @test seqd.Δt[i] ≈ seqd.Δt[midpoint]
+                @test seqd.t[midpoint] ≈ (seqd.t[i] + seqd.t[stop]) / 2
+
+                direct = KomaMRIBase.evaluate_sequence_at(seq, [seqd.t[midpoint]])
+                @test only(direct.B1) ≈ seqd.B1[midpoint]
+                @test only(direct.Δf) ≈ seqd.Δf[midpoint]
+                i += 2
+            else
+                i += 1
+            end
+        end
+    end
+end
+
+@testitem "BlochMagnusGL RF sampling" tags=[:core, :nomotion] begin
+    # GL RF intervals keep boundary rows but use two interior Gauss-Legendre nodes.
+    seq = Sequence()
+    @addblock seq += RF([1.0, 2.0, 4.0] .* 1e-6, 1e-3, [0.0, 500.0, 1000.0])
+    rule = KomaMRICore.simulation_sampling_rule(BlochMagnusGL4(), Dict("Δt" => Inf, "Δt_rf" => 2.5e-4))
+    seqd = discretize(seq; motion=NoMotion(), sampling_rule=rule)
+    c_minus = 1 / 2 - sqrt(3) / 6
+    c_plus = 1 / 2 + sqrt(3) / 6
+
+    let i = firstindex(seqd.Δt)
+        while i <= lastindex(seqd.Δt)
+            if seqd.excitation_bool[i] && seqd.Δt[i] > 0
+                i_minus, i_plus, stop = i + 1, i + 2, i + 3
+                @test i_plus <= lastindex(seqd.Δt)
+                @test stop <= lastindex(seqd.t)
+                @test seqd.excitation_bool[i_minus]
+                @test seqd.excitation_bool[i_plus]
+                Δt = sum(seqd.Δt[i:i_plus])
+                @test seqd.t[i_minus] ≈ seqd.t[i] + c_minus * Δt
+                @test seqd.t[i_plus] ≈ seqd.t[i] + c_plus * Δt
+
+                direct = KomaMRIBase.evaluate_sequence_at(seq, [seqd.t[i_minus], seqd.t[i_plus]])
+                @test direct.B1 ≈ seqd.B1[[i_minus, i_plus]]
+                @test direct.Δf ≈ seqd.Δf[[i_minus, i_plus]]
+                i += 3
+            else
+                i += 1
+            end
+        end
+    end
+end
+
+@testitem "BlochMagnus RF block length counts simulation steps" tags=[:core, :nomotion] begin
+    seq = Sequence()
+    @addblock seq += RF([1.0, 2.0, 4.0] .* 1e-6, 1e-3, [0.0, 500.0, 1000.0])
+
+    for (sim_method, eval_stride) in ((BlochMagnusMid2(), 2), (BlochMagnusQuad4(), 2), (BlochMagnusGL4(), 3))
+        rule = KomaMRICore.simulation_sampling_rule(sim_method, Dict("Δt" => Inf, "Δt_rf" => 2.5e-4))
+        seqd = discretize(seq; motion=NoMotion(), sampling_rule=rule)
+        ranges, is_excitation = KomaMRICore.get_sim_ranges(
+            seqd;
+            max_rf_block_length=1,
+            eval_intervals_per_step=KomaMRICore.eval_intervals_per_step(sim_method),
+        )
+        @test all(length(r) - 1 == eval_stride for (r, excitation) in zip(ranges, is_excitation) if excitation)
+    end
+end
+
+@testitem "BlochMagnus simulates RF-center/max-step collision" tags=[:core, :nomotion] begin
+    sys = Scanner()
+    sys.limits.Smax = 100.0
+    rf_B1 = 4.9e-6
+    rf_duration = 3.2e-3
+    slice_thickness = 8e-3
+    slice_bandwidth = 5e3
+    Gz = slice_bandwidth / (γ * slice_thickness)
+    seq = PulseDesigner.RF_sinc(rf_B1, rf_duration, sys; G=[Gz, 0.0, 0.0], TBP=8)
+    obj = Phantom(x=[0.0], y=[0.0], z=[0.0], ρ=[1.0], T1=[Inf], T2=[Inf])
+
+    for sim_method in (BlochMagnusMid2(), BlochMagnusQuad4(), BlochMagnusGL2(), BlochMagnusGL4())
+        sim_params = KomaMRICore.default_sim_params(Dict{String,Any}(
+            "gpu" => false,
+            "precision" => "f64",
+            "return_type" => "state",
+            "sim_method" => sim_method,
+            "Δt" => 1e-3,
+            "Δt_rf" => 100e-6,
+        ))
+        simulate(obj, seq, sys; sim_params, verbose=false)
+        @test true
+    end
+end
+
+@testitem "Spinors×Mag" tags=[:core, :nomotion] begin
+    using KomaMRICore: Rx, Ry, Rz, Q, rotx, roty, rotz, Un, Rφ, Rg
+
+    ## Verifying that operators perform counter-clockwise rotations
+    v = [1, 2, 3]
+    m = Mag([complex(v[1:2]...)], [v[3]])
+    # Rx
+    @test rotx(π/2) * v    ≈ [1, -3, 2]
+    @test (Rx(π/2) * m).xy ≈ [1.0 - 3.0im]
+    @test (Rx(π/2) * m).z  ≈ [2.0]
+    # Ry
+    @test roty(π/2) * v    ≈ [3, 2, -1]
+    @test (Ry(π/2) * m).xy ≈ [3.0 + 2.0im]
+    @test (Ry(π/2) * m).z  ≈ [-1.0]
+    # Rz
+    @test rotz(π/2) * v    ≈ [-2, 1, 3]
+    @test (Rz(π/2) * m).xy ≈ [-2.0 + 1.0im]
+    @test (Rz(π/2) * m).z  ≈ [3.0]
+    # Rn
+    @test Un(π/2, [1,0,0]) * v ≈ rotx(π/2) * v
+    @test Un(π/2, [0,1,0]) * v ≈ roty(π/2) * v
+    @test Un(π/2, [0,0,1]) * v ≈ rotz(π/2) * v
+    @test (Q(π/2, 1.0+0.0im, 0.0) * m).xy ≈ (Rx(π/2) * m).xy
+    @test (Q(π/2, 1.0+0.0im, 0.0) * m).z  ≈ (Rx(π/2) * m).z
+    @test (Q(π/2, 0.0+1.0im, 0.0) * m).xy ≈ (Ry(π/2) * m).xy
+    @test (Q(π/2, 0.0+1.0im, 0.0) * m).z  ≈ (Ry(π/2) * m).z
+    @test (Q(π/2, 0.0+0.0im, 1.0) * m).xy ≈ (Rz(π/2) * m).xy
+    @test (Q(π/2, 0.0+0.0im, 1.0) * m).z  ≈ (Rz(π/2) * m).z
+
+    ## Verify that Spinor rotation = matrix rotation
+    v = rand(3)
+    n = rand(3); n = n ./ sqrt(sum(n.^2))
+    m = Mag([complex(v[1:2]...)], [v[3]])
+    φ, θ, φ1, φ2 = rand(4) * 2π
+    # Rx
+    vx = rotx(θ) * v
+    mx = Rx(θ) * m
+    @test [real(mx.xy); imag(mx.xy); mx.z] ≈ vx
+    # Ry
+    vy = roty(θ) * v
+    my = Ry(θ) * m
+    @test [real(my.xy); imag(my.xy); my.z] ≈ vy
+    # Rz
+    vz = rotz(θ) * v
+    mz = Rz(θ) * m
+    @test [real(mz.xy); imag(mz.xy); mz.z] ≈ vz
+    # Rφ
+    vφ = Un(θ, [sin(φ); cos(φ); 0.0]) * v
+    mφ = Rφ(φ,θ) * m
+    @test [real(mφ.xy); imag(mφ.xy); mφ.z] ≈ vφ
+    # Rg
+    vg = rotz(φ2) * roty(θ) * rotz(φ1) * v
+    mg = Rg(φ1,θ,φ2) * m
+    @test [real(mg.xy); imag(mg.xy); mg.z] ≈ vg
+    # Rn
+    vq = Un(θ, n) * v
+    mq = Q(θ, n[1]+n[2]*1im, n[3]) * m
+    @test [real(mq.xy); imag(mq.xy); mq.z] ≈ vq
+
+    ## Spinors satify that  |α|^2 + |β|^2 = 1
+    @test abs(Rx(θ))                     ≈ [1]
+    @test abs(Ry(θ))                     ≈ [1]
+    @test abs(Rz(θ))                     ≈ [1]
+    @test abs(Rφ(φ,θ))                   ≈ [1]
+    @test abs(Q(θ, n[1]+n[2]*1im, n[3])) ≈ [1]
+
+    ## Checking properties of Introduction to the Shinnar-Le Roux algorithm.
+    # Rx = Rz(-π/2) * Ry(θ) * Rz(π/2)
+    @test rotx(θ) * v ≈ rotz(-π/2) * roty(θ) * rotz(π/2) * v
+    @test (Rx(θ) * m).xy ≈ (Rz(-π/2) * Ry(θ) * Rz(π/2) * m).xy
+    @test (Rx(θ) * m).z  ≈ (Rz(-π/2) * Ry(θ) * Rz(π/2) * m).z
+    # Rφ(φ,θ) = Rz(-φ) Ry(θ) Rz(φ)
+    @test (Rφ(φ,θ) * m).xy   ≈ (Rz(-φ) * Ry(θ) * Rz(φ) * m).xy
+    @test (Rφ(φ,θ) * m).z    ≈ (Rz(-φ) * Ry(θ) * Rz(φ) * m).z
+    # Rg(φ1, θ, φ2) = Rz(φ2) Ry(θ) Rz(φ1)
+    @test (Rg(φ1,θ,φ2) * m).xy   ≈ (Rz(φ2) * Ry(θ) * Rz(φ1) * m).xy
+    @test (Rg(φ1,θ,φ2) * m).z    ≈ (Rz(φ2) * Ry(θ) * Rz(φ1) * m).z
+    # Rg(-φ, θ, φ) = Rz(-φ) Ry(θ) Rz(φ) = Rφ(φ,θ)
+    @test rotz(-φ) * roty(θ) * rotz(φ) * v ≈ Un(θ, [sin(φ); cos(φ); 0.0]) * v
+    @test (Rg(φ,θ,-φ) * m).xy    ≈ (Rφ(φ,θ) * m).xy
+    @test (Rg(φ,θ,-φ) * m).z     ≈ (Rφ(φ,θ) * m).z
+
+    ## Verify trivial identities
+    # Rφ is an xy-plane rotation of θ around an axis making an angle of φ with respect to the y-axis
+    # Rφ φ=0 = Ry
+    @test (Rφ(0,θ) * m).xy   ≈ (Ry(θ) * m).xy
+    @test (Rφ(0,θ) * m).z    ≈ (Ry(θ) * m).z
+    # Rφ φ=π/2 = Rx
+    @test (Rφ(π/2,θ) * m).xy ≈ (Rx(θ) * m).xy
+    @test (Rφ(π/2,θ) * m).z  ≈ (Rx(θ) * m).z
+    # General rotation Rn
+    # Rn n=[1,0,0] = Rx
+    @test Un(θ, [1,0,0]) * v ≈ rotx(θ) * v
+    @test (Q(θ, 1.0+0.0im, 0.0) * m).xy ≈ (Rx(θ) * m).xy
+    @test (Q(θ, 1.0+0.0im, 0.0) * m).z  ≈ (Rx(θ) * m).z
+    # Rn n=[0,1,0] = Ry
+    @test Un(θ, [0,1,0]) * v ≈ roty(θ) * v
+    @test (Q(θ, 0.0+1.0im, 0.0) * m).xy ≈ (Ry(θ) * m).xy
+    @test (Q(θ, 0.0+1.0im, 0.0) * m).z  ≈ (Ry(θ) * m).z
+    # Rn n=[0,0,1] = Rz
+    @test Un(θ, [0,0,1]) * v ≈ rotz(θ) * v
+    @test (Q(θ, 0.0+0.0im, 1.0) * m).xy ≈ (Rz(θ) * m).xy
+    @test (Q(θ, 0.0+0.0im, 1.0) * m).z  ≈ (Rz(θ) * m).z
+
+    # Associativity
+    # Rx
+    @test (((Rz(-π/2) * Ry(θ)) * Rz(π/2)) * m).xy ≈ (Rx(θ) * m).xy
+    @test (((Rz(-π/2) * Ry(θ)) * Rz(π/2)) * m).z  ≈ (Rx(θ) * m).z
+    @test (Rz(-π/2) * (Ry(θ) * (Rz(π/2) * m))).xy ≈ (Rx(θ) * m).xy
+    @test (Rz(-π/2) * (Ry(θ) * (Rz(π/2) * m))).z  ≈ (Rx(θ) * m).z
+    # Rφ
+    @test (Rφ(φ,θ) * m).xy   ≈ (((Rz(-φ) * Ry(θ)) * Rz(φ)) * m).xy
+    @test (Rφ(φ,θ) * m).z    ≈ (((Rz(-φ) * Ry(θ)) * Rz(φ)) * m).z
+    @test (Rφ(φ,θ) * m).xy   ≈ ((Rz(-φ) * (Ry(θ) * Rz(φ))) * m).xy
+    @test (Rφ(φ,θ) * m).z    ≈ ((Rz(-φ) * (Ry(θ) * Rz(φ))) * m).z
+    # Rg
+    @test (Rg(φ1,θ,φ2) * m).xy   ≈ (((Rz(φ2) * Ry(θ)) * Rz(φ1)) * m).xy
+    @test (Rg(φ1,θ,φ2) * m).z    ≈ (((Rz(φ2) * Ry(θ)) * Rz(φ1)) * m).z
+    @test (Rg(φ1,θ,φ2) * m).xy   ≈ ((Rz(φ2) * (Ry(θ) * Rz(φ1))) * m).xy
+    @test (Rg(φ1,θ,φ2) * m).z    ≈ ((Rz(φ2) * (Ry(θ) * Rz(φ1))) * m).z
+
+    ## Other tests
+    # Test Spinor struct
+    α, β = rand(2)
+    s = Spinor(α, β)
+    @test s[1].α ≈ [Complex(α)] && s[1].β ≈ [Complex(β)]
+    # Just checking to ensure that show() doesn't get stuck and that it is covered
+    show(IOBuffer(), "text/plain", s)
+    @test true
+end
+
+@testitem "ISMRMRD" tags=[:core, :nomotion] begin
+    include("initialize_backend.jl")
+
+    seq = PulseDesigner.EPI_example()[1:10]
+    sys = Scanner()
+    obj = brain_phantom2D()[1:10]
+    parts = kfoldperm(length(obj), 2)
+
+    sim_params = KomaMRICore.default_sim_params()
+    sim_params["return_type"] = "raw"
+    sim_params["gpu"] = USE_GPU
+
+    sig1 = simulate(obj[parts[1]], seq, sys; sim_params, verbose=false)
+    sig2 = simulate(obj[parts[2]], seq, sys; sim_params, verbose=false)
+    sig = simulate(obj, seq, sys; sim_params, verbose=false)
+
+    @test isapprox(sig, sig1 + sig2; rtol=0.001)
+end
+
+@testitem "signal_to_raw_data" tags=[:core, :nomotion] begin
+    include("initialize_backend.jl")
+
+    seq = PulseDesigner.EPI_example()
+    sys = Scanner()
+    obj = brain_phantom2D()
+
+    sim_params = KomaMRICore.default_sim_params()
+    sim_params["return_type"] = "mat"
+    sim_params["gpu"] = USE_GPU
+    sig = simulate(obj, seq, sys; sim_params, verbose=false)
+
+    # Test signal_to_raw_data
+    raw = signal_to_raw_data(sig, seq)
+    sig_aux = vcat([vec(profile.data) for profile in raw.profiles]...)
+    sig_raw = reshape(sig_aux, length(sig_aux), 1)
+    @test all(sig .== sig_raw)
+
+    raw = signal_to_raw_data(cat(sig, sig, sig, sig; dims=2), seq)
+    head = raw.profiles[1].head
+    @test head.available_channels == UInt16(4)
+    @test head.active_channels == UInt16(4)
+    @test head.channel_mask[1] == UInt64(0xf)
+    @test all(iszero, head.channel_mask[2:end])
+
+    seq.DEF["FOV"] = [23e-2, 23e-2, 0]
+    raw = signal_to_raw_data(sig, seq)
+    sig_aux = vcat([vec(profile.data) for profile in raw.profiles]...)
+    sig_raw = reshape(sig_aux, length(sig_aux), 1)
+    @test all(sig .== sig_raw)
+
+    # Just checking to ensure that show() doesn't get stuck and that it is covered
+    show(IOBuffer(), "text/plain", raw)
+    @test true
+end
+
+@testitem "Pulseq labels survive raw-data conversion" tags=[:core, :nomotion] begin
+    seq = Sequence()
+    seq.DEF = Dict(
+        "Nx" => 2,
+        "Ny" => 2,
+        "Nz" => 2,
+        "FOV" => [0.1, 0.1, 0.02],
+    )
+    @addblock seq += (ADC(2, 1e-3), LabelSet(1, "NAV"), Duration(2e-3))
+    @addblock seq += (
+        ADC(2, 1e-3),
+        LabelSet(0, "NAV"),
+        LabelSet(1, "LIN"),
+        LabelSet(1, "SLC"),
+        LabelSet(2, "AVG"),
+        LabelSet(3, "ECO"),
+        LabelSet(4, "PHS"),
+        LabelSet(5, "REP"),
+        LabelSet(6, "SET"),
+        LabelSet(7, "SEG"),
+        LabelSet(1, "REV"),
+        Duration(2e-3),
+    )
+
+    raw = signal_to_raw_data(zeros(ComplexF64, 4, 1), seq)
+    navigator, imaging = getproperty.(raw.profiles, :head)
+    idx = imaging.idx
+
+    # Pulseq roles and counters survive conversion to MRD metadata.
+    @test !iszero(navigator.flags & KomaMRICore.ISMRMRD_ACQ_IS_NAVIGATION_DATA)
+    @test !iszero(imaging.flags & KomaMRICore.ISMRMRD_ACQ_IS_REVERSE)
+    @test (
+        idx.kspace_encode_step_1,
+        idx.average,
+        idx.slice,
+        idx.contrast,
+        idx.phase,
+        idx.repetition,
+        idx.set,
+        idx.segment,
+    ) == UInt16.((1, 2, 1, 3, 4, 5, 6, 7))
+    @test raw.params["encodedSize"] == raw.params["reconSize"] == [2, 2, 1]
+    @test raw.params["enc_lim_slice"] == Limit(1, 1, 1)
+
+    fallback = Sequence()
+    fallback.DEF = Dict("Nx" => 2, "Ny" => 2, "Nz" => 2, "FOV" => [0.1, 0.1, 0.01])
+    @addblock fallback += (ADC(2, 1e-3), Duration(2e-3))
+    @addblock fallback += (ADC(2, 1e-3), LabelSet(1, "NAV"), Duration(2e-3))
+    @addblock fallback += (ADC(2, 1e-3), LabelSet(0, "NAV"), Duration(2e-3))
+    @addblock fallback += (
+        ADC(2, 1e-3), LabelSet(1, "NAV"), LabelSet(3, "LIN"),
+        LabelSet(4, "PAR"), LabelSet(5, "SLC"), Duration(2e-3),
+    )
+    raw = signal_to_raw_data(zeros(ComplexF64, 8, 1), fallback)
+
+    # Neither Nz nor trailing navigator labels invent encoding counters for unlabeled imaging.
+    @test [(p.head.idx.kspace_encode_step_1, p.head.idx.slice) for p in raw.profiles[1:3]] ==
+        [(0, 0), (0, 0), (0, 0)]
+    @test raw.params["encodedSize"] == [2, 2, 1]
+    @test raw.params["enc_lim_slice"] == Limit(0, 0, 0)
+    navigator = last(raw.profiles).head.idx
+    @test (navigator.kspace_encode_step_1, navigator.kspace_encode_step_2, navigator.slice) == (3, 4, 5)
+end
+
+@testitem "ADC k-space determines exported coordinates" tags=[:core, :nomotion] begin
+    using LinearAlgebra
+
+    function encoding_sequence(dimensions)
+        seq = Sequence()
+        for direction in 1:dimensions
+            gradients = [Grad(axis == direction ? 1e-3 : 0.0, 1e-3) for axis in 1:3]
+            @addblock seq += (x=gradients[1], y=gradients[2], z=gradients[3], ADC(8, 1e-3))
+        end
+        seq.DEF = Dict("Nx"=>8, "Ny"=>dimensions >= 2 ? 8 : 1,
+            "Nz"=>dimensions == 3 ? 8 : 1, "FOV"=>fill(0.1, 3))
+        return seq
+    end
+
+    rotations = [Matrix{Float64}(I, 3, 3), [0 0 1; 1 0 0; 0 1 0], [0 1 0; 0 0 1; 1 0 0]]
+    push!(rotations, rotx(π / 6) * roty(π / 4))
+
+    # Stored coordinates and their factors recover physical XYZ coordinates after line/plane/volume rotation.
+    # MRD coordinates use Float32, so comparisons allow that format's rounding precision.
+    for dimensions in 1:3
+        seq = encoding_sequence(dimensions)
+        _, reference = get_kspace(seq)
+        signal = zeros(ComplexF32, size(reference, 1), 1)
+        for rotation in rotations
+            raw = signal_to_raw_data(signal, rotation * seq)
+            expected = reference * transpose(rotation)
+            stored_dimensions = any(!iszero, rotation[3, 1:dimensions]) ? 3 : 2
+            scale = Float32.([raw.params["userParameters"]["KomaTrajectoryScale$axis"] for axis in ("X", "Y", "Z")])
+            @test all(profile.head.trajectory_dimensions == stored_dimensions for profile in raw.profiles)
+            @test hcat((profile.traj for profile in raw.profiles)...) .* scale[1:stored_dimensions] ≈
+                Float32.(transpose(expected[:, 1:stored_dimensions]))
+        end
+    end
+
+    plane = encoding_sequence(2)
+    offset = Sequence()
+    @addblock offset += (z=Grad(100 / (γ * 1e-3), 1e-3),)
+    @addblock offset += plane
+    offset.DEF = copy(plane.DEF)
+    signal = zeros(ComplexF32, 16, 1)
+    automatic = signal_to_raw_data(signal, offset)
+    explicit = signal_to_raw_data(signal, offset; ndims=3)
+
+    # A constant nonzero kz is not a third encoding direction; explicit storage retains it.
+    @test all(profile.head.trajectory_dimensions == 2 for profile in automatic.profiles)
+    scale_z = Float32(explicit.params["userParameters"]["KomaTrajectoryScaleZ"])
+    @test all(profile.traj[3, :] .* scale_z ≈ fill(100.0f0, size(profile.traj, 2)) for profile in explicit.profiles)
+
+    partitions = Sequence()
+    @addblock partitions += (ADC(8, 1e-3),)
+    @addblock partitions += (z=Grad(1e-3, 1e-3),)
+    @addblock partitions += (ADC(8, 1e-3),)
+    partitions.DEF = Dict("Nx"=>8, "Ny"=>1, "Nz"=>2, "FOV"=>fill(0.1, 3))
+    raw = signal_to_raw_data(signal, partitions)
+
+    # kz can be constant within every readout yet encode distinct partitions without PAR.
+    @test raw.params["encodedSize"] == [8, 1, 2]
+    @test all(profile.head.idx.slice == 0 for profile in raw.profiles)
+    @test first(raw.profiles).traj[3, :] == zeros(Float32, 8)
+    scale_z = raw.params["userParameters"]["KomaTrajectoryScaleZ"]
+    @test last(raw.profiles).traj[3, :] == fill(Float32(γ * 1e-3 * 1e-3 / scale_z), 8)
+end
+
+@testitem "simulate rejects negative labels" tags=[:core, :nomotion] begin
+    obj = Phantom(x=[0.0])
+    seq = Sequence([Grad(0, 1e-3)])
+    for label in (LabelSet(-1, "LIN"), LabelInc(-1, "LIN"))
+        seq.EXT[1] = [label]
+        @test_throws Exception simulate(obj, seq, Scanner(); verbose=false)
+    end
+end
+
+@testitem "simulation precision" tags=[:core, :nomotion] begin
+    # Changing numeric precision must preserve spin identities beyond Float32's exact integers.
+    first_spin = Int(maxintfloat(Float32)) + 1
+    selected = first_spin:2:first_spin+4
+    motion = translate(1.0, 0.0, 0.0, TimeRange(0.0, 1.0), SpinRange(selected))
+    @test f32(motion).spins.range == selected
+
+    seq = Sequence()
+    @addblock seq += RF([1.0, 2.0, 1.0] .* 1e-6, 1e-4, [0.0, 0.0, 0.0])
+    obj = Phantom(
+        x=[-5e-4, 0.0, 5e-4], y=[0.0, 4e-4, -4e-4], z=zeros(3),
+        ρ=ones(3), T1=fill(1e6, 3), T2=fill(1e6, 3), Δw=zeros(3),
+    )
+
+    precision_cases = (
+        ("f32", Float32, f32, range(-5e-4, 5e-4; length=3)),
+        ("f64", Float64, f64, range(-5f-4, 5f-4; length=3)),
+        ("bigfloat", BigFloat, fbig, range(-5e-4, 5e-4; length=3)),
+    )
+    for (precision, T, to_precision, coordinates) in precision_cases
+        unit = one(first(coordinates))
+        receiver = ArbitraryCoilSens(
+            coordinates, coordinates, [zero(unit)],
+            fill(complex(unit), 3, 3, 1, 1),
+        )
+        converted_receiver = to_precision(Scanner(; receiver)).receiver
+        sim_params = Dict{String,Any}(
+            "gpu" => false,
+            "Nthreads" => 1,
+            "return_type" => "state",
+            "precision" => precision,
+            "sim_method" => BlochMagnus1(),
+            "Δt" => Inf,
+            "Δt_rf" => 50e-6,
+        )
+        state = simulate(obj, seq, Scanner(); sim_params, verbose=false)
+        @test eltype(state.xy) === Complex{T}
+        @test eltype(state.z) === T
+
+        # Requested precision must reach range-backed sensitivity-map geometry and data.
+        @test all(axis -> eltype(axis) === T, (
+            converted_receiver.x, converted_receiver.y, converted_receiver.z,
+        ))
+        @test eltype(converted_receiver.coil_sens) === Complex{T}
+    end
+
+end
+
+@testitem "Receive coil signal equation" tags=[:core, :nomotion] begin
+    include("initialize_backend.jl")
+    import KomaMRIBase: get_n_coils, get_sens
+
+    struct ConstantCoilSens{W<:Tuple} <: AbstractRFReceiveSystem
+        weights::W
+    end
+    get_n_coils(receiver::ConstantCoilSens) = length(receiver.weights)
+    function get_sens(receiver::ConstantCoilSens, x, y, z)
+        sens = similar(x, Complex{eltype(x)}, length(x), get_n_coils(receiver))
+        for coil in axes(sens, 2)
+            @views sens[:, coil] .= receiver.weights[coil]
+        end
+        return sens
+    end
+
+    coords = range(-1e-3, 1e-3; length=3)
+    ncoils = 16
+    weights = ntuple(coil -> cis(2π * (coil - 1) / ncoils), ncoils)
+    coil_sens = [
+        complex(
+            1 + 100x + 50y + 25z + 0.1coil,
+            -50x + 75y - 25z + 0.05coil,
+        ) for x in coords, y in coords, z in coords, coil in eachindex(weights)
+    ]
+    receivers = (
+        ArbitraryCoilSens(coords, coords, coords, coil_sens),
+        BirdcageCoilSens(; ncoils),
+        ConstantCoilSens(weights),
+    )
+
+    seq = Sequence()
+    @addblock seq += RF([1.0, 2.0, 1.0] .* 1e-6, 1e-4, [0.0, 0.0, 0.0])
+    @addblock seq += (
+        ADC(8, 2e-4),
+        x=Grad(2e-3, 2e-4),
+        y=Grad(-1e-3, 2e-4),
+    )
+    obj = Phantom(
+        x=[-0.7e-3, 0.2e-3, 0.8e-3],
+        y=[0.4e-3, -0.6e-3, 0.1e-3],
+        z=[-0.2e-3, 0.5e-3, 0.7e-3],
+        ρ=[0.8, 1.0, 0.6],
+        T1=[1.0, 1.2, 0.9],
+        T2=[0.08, 0.06, 0.1],
+        Δw=2π .* [-40.0, 15.0, 70.0],
+    )
+
+    # The receive equation is Sᶜ(t) = Σᵢ Mxyᵢ(t) Cᶜ(rᵢ). These methods cover
+    # the generic, optimized Bloch, and Magnus acquisition implementations.
+    for sim_method in (BlochSimple(), Bloch(), BlochMagnusGL4())
+        @testset "$(nameof(typeof(sim_method)))" begin
+            sim_params = Dict{String,Any}(
+                "gpu" => USE_GPU,
+                "return_type" => "mat",
+                "sim_method" => sim_method,
+            )
+            spin_signals = hcat([
+                simulate(obj[spin], seq, Scanner(); sim_params, verbose=false)[:, 1, 1]
+                for spin in eachindex(obj.x)
+            ]...)
+            for receiver in receivers
+                signal = simulate(
+                    obj, seq, Scanner(; receiver); sim_params, verbose=false,
+                )[:, :, 1]
+                @test signal ≈ spin_signals * get_sens(
+                    receiver, obj.x, obj.y, obj.z,
+                )
+            end
+        end
+    end
+end
+
+@testitem "repeated single-spin FID" tags=[:core, :nomotion] begin
+    rf = PulseDesigner.make_block_pulse(π / 2; duration=300e-6, delay=100e-6)
+    adc = PulseDesigner.make_adc(4096; dwell=62.5e-6, delay=20e-6)
+
+    seq = Sequence()
+    for _ in 1:30
+        @addblock seq += (rf, Duration(20e-3))
+        @addblock seq += (adc, Duration(10.0))
+    end
+
+    obj = Phantom(x=[0.0], y=[0.0], z=[0.0], T1=[1.0], T2=[0.1], Δw=[100.0])
+    sim_params = Dict{String,Any}(
+        "gpu" => false,
+        "return_type" => "mat",
+        "sim_method" => Bloch(),
+    )
+    raw = simulate(obj, seq, Scanner(); sim_params, verbose=false)
+    first_adc = raw[1:4096:end, 1, 1]
+
+    # Regression: timing roundoff used to place RF samples incorrectly,
+    # changing the effective flip angle and the acquired signal in later TRs.
+    @test minimum(abs, first_adc) / maximum(abs, first_adc) > 0.99
+    @test maximum(abs, first_adc ./ first(first_adc) .- 1) < 1e-3
+end
+
+@testitem "cardiac trigger delay positions the first sequence event" tags=[:core, :nomotion] begin
+    trigger_delay = 0.1
+    r_peak = 0.5
+    sys = Scanner()
+    seq = Sequence(sys)
+    @addblock seq += PulseDesigner.make_trigger(:physio1; duration=trigger_delay, sys)
+    @addblock seq += ADC(2, 1e-6)
+
+    obj = Phantom(x=[0.0])
+    sim_params = Dict{String,Any}("gpu" => false)
+    triggered = simulate(
+        obj,
+        seq,
+        sys;
+        sim_params,
+        verbose=false,
+        physio=CardiacSignal(; r_peaks=[r_peak]),
+    )
+
+    triggered_time = triggered.profiles[1].head.acquisition_time_stamp
+    acquisition_timestamp_unit = 1e-6
+    expected_time = round(Int, (r_peak + trigger_delay) / acquisition_timestamp_unit)
+    @test triggered_time == expected_time
+end
+
+@testitem "Bloch" tags=[:important, :core, :nomotion, :bloch] begin
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    sig_jemris = signal_sphere_jemris()
+    seq = seq_epi_100x100_TE100_FOV230()
+    obj = phantom_sphere()
+    sys = Scanner()
+
+    for sim_method in (
+        KomaMRICore.Bloch(),
+        KomaMRICore.BlochMagnusConst1(),
+        KomaMRICore.BlochMagnusLin2(),
+        KomaMRICore.BlochMagnusLinComm2(),
+        KomaMRICore.BlochMagnusQuad2(),
+        KomaMRICore.BlochMagnusQuad4(),
+        KomaMRICore.BlochMagnusGL2(),
+        KomaMRICore.BlochMagnusGL4()
+    )
+        @testset "$(nameof(typeof(sim_method)))" begin
+            sim_params = Dict{String, Any}(
+                "gpu"=>USE_GPU,
+                "sim_method"=>sim_method,
+                "return_type"=>"mat"
+            )
+            sig = simulate(obj, seq, sys; sim_params, verbose=false)
+            sig = sig / prod(size(obj))
+
+            @test NRMSE(sig, sig_jemris) < 1 #NRMSE < 1%
+        end
+    end
+
+end
+
+@testitem "Bloch waveform event type accuracy" tags=[:core, :nomotion] begin
+    using OrdinaryDiffEqTsit5
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    Tpulse = 1e-3
+    Tgrad = 1e-3
+    Tadc = 1e-3
+    Nadc = 6
+    M0 = 1.0
+    T1 = 1000e-3
+    T2 = 40e-3
+    Δw = 2π * 30
+    x0 = 1e-2
+    B1 = 1.5e-6 * cis(π / 7)
+    Gx = 0.2e-3
+
+    sys = Scanner()
+    obj = Phantom(x=[x0], ρ=[M0], T1=[T1], T2=[T2], Δw=[Δw])
+
+    grad_events = (
+        "trap" => Grad(Gx, Tgrad),
+        "uniform" => Grad([Gx, Gx], Tgrad),
+        "time-shaped" => Grad([Gx, Gx], [Tgrad]),
+    )
+    rf_events = (
+        "block" => RF(B1, Tpulse),
+        "uniform" => RF([B1, B1], Tpulse),
+        "time-shaped" => RF([B1, B1], [Tpulse]),
+    )
+
+    function waveform_sequence(grad, rf)
+        seq = Sequence()
+        @addblock seq += rf + (ADC(Nadc, Tadc), x=grad)
+        return seq
+    end
+
+    ref_seq = waveform_sequence(grad_events[1][2], rf_events[1][2])
+    ref_adc_times = get_adc_sampling_times(ref_seq)
+    mxy_diffeq = diffeq_signal(ref_seq, obj; tstops=[Tpulse, Tpulse + Tgrad])
+
+    for (grad_name, grad) in grad_events, (rf_name, rf) in rf_events
+        seq = waveform_sequence(grad, rf)
+        @test get_adc_sampling_times(seq) ≈ ref_adc_times
+        for sim_method in (Bloch(), BlochMagnusConst1(), BlochMagnusLin2(), BlochMagnusLinComm2(), BlochMagnusQuad2(), BlochMagnusQuad4(), BlochMagnusGL2(), BlochMagnusGL4())
+            @testset "$grad_name/$rf_name $(nameof(typeof(sim_method)))" begin
+                sim_params = Dict{String, Any}(
+                    "gpu" => USE_GPU,
+                    "return_type" => "mat",
+                    "sim_method" => sim_method,
+                )
+                raw = simulate(obj, seq, sys; sim_params, verbose=false)[:, 1, 1]
+                @test NRMSE(raw, mxy_diffeq) < 0.1
+            end
+        end
+    end
+end
+
+@testitem "Bloch_RF_accuracy" tags=[:important, :core, :nomotion] begin
+    using OrdinaryDiffEqTsit5
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    # Seq params
+    Tadc = 1e-3
+    Trf = Tadc
+    B1 = 2e-6 * (Tadc / Trf)
+    rf_phase = [0, π/2]
+    Gx = 25e-3
+    Nadc = 6
+    # Phantom params
+    M0 = 1.0
+    T1 = 1000e-3
+    T2 = 20e-3
+    Δw = 2π * 100
+    x = 1e-2
+    
+    ## Solving using KomaMRI
+    seq = Sequence()
+    @addblock seq += ADC(Nadc, Tadc)
+    @addblock seq += (RF(B1 .* cis(rf_phase[1]), Trf), x=Grad(Gx, Trf))
+    @addblock seq += ADC(Nadc, Tadc)
+    # This introduces an RF-ADC overlap!!!
+    @addblock seq += (RF(B1 .* cis(rf_phase[2]), Trf), ADC(Nadc, 2Tadc, Trf/2))
+
+    sys = Scanner()
+    obj = Phantom(x = [x], ρ = [M0], T1 = [T1], T2 = [T2], Δw = [Δw])
+
+    mxy_diffeq = diffeq_signal(seq, obj)
+
+    ## Solve with KomaMRI
+    methods_to_test = [Bloch(), BlochMagnusConst1(), BlochMagnusLin2(), BlochMagnusLinComm2(), BlochMagnusQuad2(), BlochMagnusQuad4(), BlochMagnusGL2(), BlochMagnusGL4()]
+    sim_params_to_test = [Dict{String, Any}("Δt_rf"=>1e-5, "return_type"=>"mat", "sim_method"=>method) for method in methods_to_test]
+    for sim_params in sim_params_to_test
+        @testset "$(sim_params["sim_method"])" begin 
+            raw = simulate(obj, seq, sys; sim_params, verbose=false)[:, 1, 1]
+            @test NRMSE(raw, mxy_diffeq) < 0.1
+        end
+    end
+end
+
+@testitem "Bloch_phase_compensation" tags=[:important, :core, :nomotion] begin
+    include("initialize_backend.jl")
+
+    Tadc = 1e-3
+    Trf = Tadc
+    T1 = 1000e-3
+    T2 = 20e-3
+    Δw = 2π * 100
+    B1 = 2e-6 * (Tadc / Trf)
+    N = 6
+
+    sys = Scanner()
+    obj = Phantom(x=[0.],T1=[T1],T2=[T2],Δw=[Δw])
+
+    rf_phase = 2π*rand()
+    seq1 = Sequence()
+    seq1 += RF(B1, Trf)
+    seq1 += ADC(N, Tadc)
+
+    seq2 = Sequence()
+    seq2 += RF(B1 .* exp(1im*rf_phase), Trf)
+    seq2 += ADC(N, Tadc, 0, 0, rf_phase)
+
+    for sim_method in (
+        KomaMRICore.Bloch(),
+        KomaMRICore.BlochMagnusConst1(),
+        KomaMRICore.BlochMagnusLin2(),
+        KomaMRICore.BlochMagnusLinComm2(),
+        KomaMRICore.BlochMagnusQuad2(),
+        KomaMRICore.BlochMagnusQuad4(),
+        KomaMRICore.BlochMagnusGL2(),
+        KomaMRICore.BlochMagnusGL4()
+    )
+        @testset "$(nameof(typeof(sim_method)))" begin
+            sim_params = Dict{String, Any}("Δt_rf"=>1e-5, "gpu"=>USE_GPU, "sim_method"=>sim_method)
+            raw1 = simulate(obj, seq1, sys; sim_params, verbose=false)
+            raw2 = simulate(obj, seq2, sys; sim_params, verbose=false)
+
+            @test raw1.profiles[1].data ≈ raw2.profiles[1].data
+        end
+    end
+end
+
+@testitem "BlochDict" tags=[:important, :core, :nomotion, :blochdict] begin
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    seq = seq_epi_100x100_TE100_FOV230()
+    obj = Phantom(x=[0.], T1=[1000e-3], T2=[100e-3])
+    sys = Scanner()
+    sim_params = Dict(
+        "gpu"=>USE_GPU,
+        "sim_method"=>KomaMRICore.Bloch(),
+        "return_type"=>"mat")
+    sig = simulate(obj, seq, sys; sim_params, verbose=false)
+    sig = sig / prod(size(obj))
+    sim_params["sim_method"] = KomaMRICore.BlochDict()
+    sig2 = simulate(obj, seq, sys; sim_params, verbose=false)
+    sig2 = sig2 / prod(size(obj))
+    @test sig ≈ sig2
+
+    sig_jemris = signal_sphere_jemris()
+    seq = seq_epi_100x100_TE100_FOV230()
+    obj = phantom_sphere()
+    sys = Scanner()
+    sig = simulate(obj, seq, sys; sim_params, verbose=false)
+    sig = sum(sig; dims=2) / prod(size(obj))
+    @test NRMSE(sig, sig_jemris) < 1 #NRMSE < 1%
+
+    sim_params["sim_method"] = KomaMRICore.BlochDict(save_Mz=true)
+    sig2 = simulate(obj[1], seq[1:100], sys; sim_params, verbose=false)
+    @test true # Just checking that it runs, TODO: compare to DiffEq
+
+    # Just checking to ensure that show() doesn't get stuck and that it is covered
+    show(IOBuffer(), "text/plain", KomaMRICore.BlochDict())
+    @test true
+end
+
+@testitem "BlochSimple" tags=[:important, :core, :nomotion, :blochsimple] begin
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    sig_jemris = signal_sphere_jemris()
+    seq = seq_epi_100x100_TE100_FOV230()
+    obj = phantom_sphere()
+    sys = Scanner()
+
+    sim_params = Dict{String, Any}(
+        "gpu"=>USE_GPU,
+        "sim_method"=>KomaMRICore.BlochSimple(),
+        "return_type"=>"mat"
+    )
+    sig = simulate(obj, seq, sys; sim_params, verbose=false)
+    sig = sig / prod(size(obj))
+
+    @test NRMSE(sig, sig_jemris) < 1 #NRMSE < 1%
+end
+
+@testitem "simulate_slice_profile" tags=[:core, :nomotion] begin
+    include("initialize_backend.jl")
+
+    # This is a sequence with a sinc RF 30° excitation pulse
+    sys = Scanner()
+    sys.limits.Smax = 50
+    B1 = 4.92e-6
+    Trf = 3.2e-3
+    zmax = 2e-2
+    fmax = 5e3
+    z = range(-zmax, zmax, 400)
+    Gz = fmax / (γ * zmax)
+    seq = PulseDesigner.RF_sinc(B1, Trf, sys; G=[0; 0; Gz], TBP=8)
+
+    sim_params = Dict{String, Any}(
+        "Δt_rf" => Trf / length(seq.RF.A[1]),
+        "gpu" => USE_GPU)
+
+    @testset "frequency offset shifts sinc slice profile" begin
+        sample_shift = 40
+        Δf = γ * Gz * sample_shift * step(z)
+        shifted_seq = PulseDesigner.RF_sinc(B1, Trf, sys; G=[0; 0; Gz], Δf, TBP=8)
+        methods_to_test = (
+            KomaMRICore.Bloch(),
+            KomaMRICore.BlochDict(),
+            KomaMRICore.BlochMagnusConst1(),
+            KomaMRICore.BlochMagnusLin2(),
+            KomaMRICore.BlochMagnusLinComm2(),
+            KomaMRICore.BlochMagnusQuad2(),
+            KomaMRICore.BlochMagnusQuad4(),
+            KomaMRICore.BlochMagnusGL2(),
+            KomaMRICore.BlochMagnusGL4(),
+        )
+        for sim_method in methods_to_test
+            @testset "$(nameof(typeof(sim_method)))" begin
+                for max_rf_block_length in (Inf, 30, 1)
+                    @testset "max_rf_block_length=$max_rf_block_length" begin
+                        shifted_sim_params = copy(sim_params)
+                        shifted_sim_params["sim_method"] = sim_method
+                        shifted_sim_params["max_rf_block_length"] = max_rf_block_length
+                        base_sim_params = copy(shifted_sim_params)
+                        M_base = simulate_slice_profile(seq; z, sim_params=base_sim_params, verbose=false)
+                        M_shifted = simulate_slice_profile(shifted_seq; z, sim_params=shifted_sim_params, verbose=false)
+
+                        profile = abs.(M_base.xy)
+                        shifted_profile = abs.(M_shifted.xy)
+                        expected = profile[1:(end - sample_shift)]
+                        shifted = shifted_profile[(1 + sample_shift):end]
+                        @test shifted ≈ expected
+                    end
+                end
+            end
+        end
+    end
+end
+
+@testitem "freq_in_phase preserves RF frequency offsets" tags=[:core, :nomotion, :gpu] begin
+    include("initialize_backend.jl")
+
+    sim_params = Dict{String,Any}(
+        "gpu" => USE_GPU,
+        "return_type" => "state",
+        "Δt" => Inf,
+        "Δt_rf" => 5e-6,
+    )
+    methods = (Bloch(), BlochSimple(), BlochMagnus1(), BlochMagnus2(), BlochMagnus4(), BlochMagnus6())
+
+    @testset "slice-selective excitation" begin
+        sys = Scanner()
+        sys.limits.Smax = 50
+        B1 = 4.92e-6
+        Trf = 3.2e-3
+        z0 = 4e-3
+        z = [-z0, 0.0, z0]
+        Gz = 5e3 / (γ * 0.02)
+        Δf = γ * Gz * z0
+        seq = PulseDesigner.RF_sinc(B1, Trf, sys; G=[0; 0; Gz], TBP=8)
+        shifted_seq = PulseDesigner.RF_sinc(B1, Trf, sys; G=[0; 0; Gz], Δf=Δf, TBP=8)
+
+        for method in methods, freq_in_phase in (false, true)
+            params = copy(sim_params)
+            params["sim_method"] = method
+            params["freq_in_phase"] = freq_in_phase
+            profile = abs.(simulate_slice_profile(seq; z, sim_params=copy(params), verbose=false).xy)
+            shifted_profile = abs.(simulate_slice_profile(shifted_seq; z, sim_params=copy(params), verbose=false).xy)
+            @test z[argmax(profile)] == 0.0
+            @test z[argmax(shifted_profile)] == z0
+        end
+    end
+
+    @testset "adiabatic inversion" begin
+        duration = 18.3e-3
+        b1max = 13.5e-6
+        β̂ = 4
+        μ = 6
+        β = 2β̂ / duration
+        t = range(-duration / 2, duration / 2, 4001)
+        B1 = b1max .* sech.(β .* t)
+        Δf = -μ * β .* tanh.(β .* t) ./ (2π)
+        shift = 1000.0
+        freqs = [-shift, 0.0, shift]
+        obj = Phantom(x=zeros(length(freqs)), y=zeros(length(freqs)), z=zeros(length(freqs)), Δw=2π .* freqs)
+        seq = Sequence()
+        shifted_seq = Sequence()
+        @addblock seq += RF(B1, duration, Δf, 0)
+        @addblock shifted_seq += RF(B1, duration, Δf .+ shift, 0)
+
+        for method in methods, freq_in_phase in (false, true)
+            params = copy(sim_params)
+            params["sim_method"] = method
+            params["freq_in_phase"] = freq_in_phase
+            profile = simulate(obj, seq, Scanner(); sim_params=copy(params), verbose=false).z
+            shifted_profile = simulate(obj, shifted_seq, Scanner(); sim_params=copy(params), verbose=false).z
+            @test freqs[argmin(profile)] == 0.0
+            @test freqs[argmin(shifted_profile)] == shift
+        end
+    end
+
+    @testset "fat saturation" begin
+        Δf = -440.0
+        seq = Sequence()
+        @addblock seq += RF(fill(1.0e-6, 65), 1e-3, Δf)
+        seq.RF[1].A .*= 90 / only(get_flip_angles(seq))
+        freqs = [-Δf, 0.0, Δf]
+        obj = Phantom(x=zeros(length(freqs)), Δw=2π .* freqs)
+
+        for method in methods, freq_in_phase in (false, true)
+            params = copy(sim_params)
+            params["sim_method"] = method
+            params["freq_in_phase"] = freq_in_phase
+            state = simulate(obj, seq, Scanner(); sim_params=params, verbose=false)
+            @test freqs[argmin(abs.(state.z))] == Δf
+        end
+    end
+end
+
+@testitem "GPU Functions" tags=[:core, :nomotion, :gpu] begin
+    using Suppressor
+    import KernelAbstractions as KA
+    include("initialize_backend.jl")
+
+    x = ones(Float32, 1000)
+
+    begin
+        if USE_GPU
+            y = x |> gpu
+            @test KA.get_backend(y) isa KA.GPU
+            y = y |> cpu
+            @test KA.get_backend(y) isa KA.CPU
+        else
+            # Test that gpu and cpu are no-ops
+            y = x |> gpu
+            @test y == x
+            y = y |> cpu
+            @test y == x
+        end
+    end
+
+    @suppress print_devices()
+    @test true
+end
+
+# --------- Motion-related tests -------------
+# We compare with the result given by OrdinaryDiffEqTsit5
+@testitem "Motion" tags=[:core, :motion] begin
+    using OrdinaryDiffEqTsit5
+    include("initialize_backend.jl")
+    include(joinpath(@__DIR__, "test_files", "utils.jl"))
+
+    Nadc = 25
+    M0 = 1.0
+    T1 = 100e-3
+    T2 = 10e-3
+    B1 = 20e-6
+    Trf = 3e-3
+    φ = π / 4
+    duration = 2*Trf
+
+    Gx = 1e-3
+    Gy = 1e-3
+    Gz = 0.0
+
+    motions = [
+        translate(0.1, 0.1, 0.0, TimeRange(0.0, 1.0)),
+        rotate(0.0, 0.0, 45.0, TimeRange(0.0, 1.0)),
+        heartbeat(-0.6, 0.0, 0.0, Periodic(period=1.0)),
+        path([0.0 0.0], [0.0 1.0], [0.0 0.0], TimeRange(0.0, 10.0)),
+        flowpath([0.0 0.0], [0.0 1.0], [0.0 0.0], [false false], TimeRange(0.0, 10.0)) # We should find a way to test this when spin_reset flags are true
+    ]
+
+    x0 = [0.1]
+    y0 = [0.1]
+    z0 = [0.0]
+
+    for sim_method in [
+        KomaMRICore.Bloch(),
+        KomaMRICore.BlochSimple(),
+        KomaMRICore.BlochDict(),
+        KomaMRICore.BlochMagnusConst1(),
+        KomaMRICore.BlochMagnusLin2(),
+        KomaMRICore.BlochMagnusLinComm2(),
+        KomaMRICore.BlochMagnusQuad2(),
+        KomaMRICore.BlochMagnusQuad4(),
+        KomaMRICore.BlochMagnusGL2(),
+        KomaMRICore.BlochMagnusGL4()
+    ]
+        @testset "$(typeof(sim_method))" begin
+            for motion in motions
+                seq = Sequence()
+                @addblock seq += RF(cis(φ) .* B1, Trf) + (
+                    ADC(Nadc, duration - Trf, Trf),
+                    x=Grad(Gx, duration),
+                    y=Grad(Gy, duration),
+                    z=Grad(Gz, duration),
+                )
+                obj = Phantom(x = x0, y = y0, z = z0, ρ = [M0], T1 = [T1], T2 = [T2], motion = motion)
+                sys = Scanner()
+                mxy_diffeq = diffeq_signal(seq, obj)
+                sim_params = Dict{String, Any}(
+                    "sim_method"=>sim_method,
+                    "return_type"=>"mat",
+                    "gpu" => USE_GPU
+                )
+                raw_aux = simulate(obj, seq, sys; sim_params, verbose=false)
+                raw = raw_aux[:, 1, 1]
+                @test NRMSE(raw, mxy_diffeq) < 1
+            end
+        end
+    end
+
+    # With no spatial encoding, motion changes only the coil weighting:
+    # Sᶜ(t) = Mxy(t) Cᶜ(r(t)).
+    motion_duration = 2e-3
+    motion = translate(0.8e-3, 0.0, 0.0, TimeRange(0.0, motion_duration))
+    moving_obj = Phantom(
+        x=[-0.4e-3], y=[0.0], z=[0.0],
+        ρ=[1.0], T1=[1e6], T2=[1e6], motion=motion,
+    )
+    coil_grid = [-1.0, 0.0, 1.0] .* 1e-3
+    coil_sens = [
+        complex(1 + 200x + 0.1coil, -100x + 0.2coil) for
+        x in coil_grid, _ in 1:1, _ in 1:1, coil in 1:2
+    ]
+    receivers = (
+        ArbitraryCoilSens(coil_grid, [0.0], [0.0], coil_sens),
+        BirdcageCoilSens(; ncoils=4),
+    )
+    moving_seq = Sequence()
+    rf_duration = 1e-4
+    @addblock moving_seq += RF(1 / (4γ * rf_duration), rf_duration)
+    @addblock moving_seq += ADC(7, motion_duration - rf_duration)
+    sim_params = Dict{String,Any}(
+        "sim_method" => Bloch(),
+        "return_type" => "mat",
+        "gpu" => USE_GPU,
+    )
+    uniform_signal =
+        simulate(moving_obj, moving_seq, Scanner(); sim_params, verbose=false)[:, 1, 1]
+    x, y, z = get_spin_coords(
+        motion, moving_obj.x, moving_obj.y, moving_obj.z,
+        get_adc_sampling_times(moving_seq)',
+    )
+    for receiver in receivers
+        signal = simulate(
+            moving_obj, moving_seq, Scanner(; receiver); sim_params, verbose=false,
+        )[:, :, 1]
+        @test signal ≈
+            reshape(uniform_signal, :, 1) .* get_sens(receiver, vec(x), vec(y), vec(z))
+    end
+end

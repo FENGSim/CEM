@@ -1,0 +1,133 @@
+const LOADED_BACKENDS = Ref{Vector{KA.GPU}}([])
+const BACKEND = Ref{Union{KA.Backend,Nothing}}(nothing)
+const DEFAULT_PRECESSION_GROUPSIZE = 256
+const DEFAULT_EXCITATION_GROUPSIZE = 256
+
+device_name(backend) = @error "device_name called with invalid backend type $(typeof(backend))"
+isfunctional(::KA.CPU) = true
+isfunctional(x) = false
+supports_warp_reduction(backend) = false
+_devices(::KA.CPU) = []
+name(::KA.CPU) = "CPU"
+set_device!(backend, val) = @error "set_device! called with invalid parameter types: '$(typeof(backend))', '$(typeof(val))'" 
+set_device!(val) = set_device!(get_backend(true), val)
+function shfl_down end
+
+struct Literal{T} end
+Literal(T) = Literal{T}()
+Base.:*(x::Number, ::Literal{T}) where T = T(x)
+
+const u32 = Literal(UInt32)
+
+"""
+    get_backend(use_gpu; verbose=true)
+
+Gets the simulation backend to use. If `use_gpu=false` or there are no available GPU backends,
+returns `CPU()`, else returns the GPU backend (currently either `CUDABackend()`,
+`MetalBackend()`, `ROCBackend()`, or `oneAPIBackend()`).
+
+The GPU package for the corresponding backend (CUDA.jl, Metal.jl, AMDGPU.jl, or
+oneAPI.jl) must be loaded and functional, otherwise KomaMRI will default to using
+the CPU. oneAPI support is experimental.
+
+# Arguments
+- `use_gpu`: if true, attempt to use GPU and check for available backends
+- `verbose`: if true, print backend selection information
+
+# Returns
+- `backend`: selected `KernelAbstractions.Backend`
+"""
+function get_backend(use_gpu; verbose=true)
+    if !isnothing(BACKEND[])
+        # The backend can be set and still need to change based on the value of
+        # use_gpu, e.g. if switching between CPU and GPU while running tests
+        ((BACKEND[] isa KA.GPU) == use_gpu) && return BACKEND[]
+    end
+
+    if !use_gpu
+        BACKEND[] = KA.CPU()
+        return BACKEND[]
+    end
+
+    if isempty(LOADED_BACKENDS[])
+        if verbose
+            @info """
+              The GPU functionality is being called but no GPU backend is loaded
+              to access it. Add 'using CUDA / Metal / AMDGPU / oneAPI' to your
+              code. Defaulting back to the CPU. (No action is required if you want
+              to run on the CPU). oneAPI support is experimental.
+            """ maxlog=1
+        end
+        BACKEND[] = KA.CPU()
+        return BACKEND[]
+    end
+
+    functional_gpu_backends = []
+    for backend in LOADED_BACKENDS[]
+        if isfunctional(backend)
+            push!(functional_gpu_backends, backend)
+        else
+            @warn "Loaded backend $(name(backend)) is not functional" maxlog=1
+        end
+    end
+    
+    if length(functional_gpu_backends) == 1
+        BACKEND[] = functional_gpu_backends[1]
+        if verbose
+            @info """Using  backend: '$(name(BACKEND[]))'"""  maxlog = 1
+        end
+        return BACKEND[]
+    elseif length(functional_gpu_backends) == 0
+        if verbose
+            @info """Defaulting back to the CPU. (No action is required if you want to run on the CPU). """ maxlog = 1
+        end
+        BACKEND[] = KA.CPU()
+        return BACKEND[]
+    else
+        # Will probably never get here
+        if verbose
+            @info """
+              Multiple functional backends have been loaded and KomaMRI does not
+              know which one to use. Ensure that your code contains only one 'using'
+              statement for the GPU backend you wish to use. Defaulting back to the
+              CPU. (No action is required if you want to run on the CPU).
+            """ maxlog = 1
+        end
+        BACKEND[] = KA.CPU()
+        return BACKEND[]
+    end
+end
+
+"""
+    get_devices(use_gpu=true)
+
+Return available simulation devices as named tuples with `backend`, `id`, `name`,
+and `current` fields. The CPU is always first (`id=nothing`). GPU devices are included
+only when a supported backend is loaded and functional; this does not load GPU packages
+or switch devices. `current` identifies the current device within each backend.
+
+Pass a GPU's `id` to `sim_params["gpu_device"]` or `set_device!`. IDs follow the
+backend's selection API: CUDA is zero-based; AMDGPU, oneAPI, and Metal are one-based.
+Use `get_devices(false)` to list only the CPU.
+"""
+function get_devices(use_gpu=true)
+    backend = get_backend(use_gpu; verbose=false)
+    return [(backend="CPU", id=nothing, name=first(Sys.cpu_info()).model, current=true);
+        [(; backend=name(backend), device...) for device in _devices(backend)]]
+end
+
+"""
+    print_devices(use_gpu=true)
+
+Print the devices returned by [`get_devices`](@ref). An asterisk marks the current
+device within each backend. Listing devices does not change the selected device.
+"""
+function print_devices(use_gpu=true)
+    for device in get_devices(use_gpu)
+        label = device.backend == "CPU" ? "CPU" : "$(device.backend) $(device.id)$(device.current ? "*" : "")"
+        @info "$label: $(device.name)"
+    end
+    return nothing
+end
+
+export get_devices, print_devices, set_device!

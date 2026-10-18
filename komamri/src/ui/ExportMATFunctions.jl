@@ -1,0 +1,165 @@
+function export_2_mat_sequence(seq, matfolder; matfilename="seq_sequence.mat")
+
+    # Get the sequence event waveforms
+    samples = get_samples(seq)
+
+    # Create a dictionary with the sampled event waveforms
+    Gx = hcat(samples.gx.t, samples.gx.A)
+    Gy = hcat(samples.gy.t, samples.gy.A)
+    Gz = hcat(samples.gz.t, samples.gz.A)
+    RF_AM = hcat(samples.rf.t, samples.rf.A)
+    RF_FM = hcat(samples.Δf.t, samples.Δf.A)
+    ADCS = hcat(samples.adc.t, samples.adc.A)
+    seq_dict = Dict{String,Any}(
+        "Gx" => Gx,
+        "Gy" => Gy,
+        "Gz" => Gz,
+        "RF_AM" => RF_AM,
+        "RF_FM" => RF_FM,
+        "ADCS" => ADCS
+    )
+    (; labels, adc_blocks) = adc_label_context(seq)
+    seq_dict["definitions"] = _mat_value(seq.DEF)
+    seq_dict["adc"] = Dict(
+        "block" => adc_blocks,
+        "num_samples" => [seq.ADC[b].N for b in adc_blocks],
+        "labels" => Dict(
+            string(name) => [getproperty(labels[b], name) for b in adc_blocks]
+            for name in fieldnames(KomaMRIBase.AdcLabels)
+        ),
+    )
+
+    # Write to matlab file
+    matwrite(joinpath(matfolder, matfilename), Dict("sequence" => seq_dict))
+end
+
+function export_2_mat_kspace(seq, matfolder; matfilename="seq_kspace.mat")
+    sampling_rule = MaxStepSizeRule(1, 5e-5)
+    kspace, kspace_adc = get_kspace(seq; sampling_rule)
+    matwrite(joinpath(matfolder, matfilename), Dict("kspace" => kspace, "kspace_adc" => kspace_adc))
+end
+
+function export_2_mat_moments(seq, matfolder; matfilename="seq_moments.mat")
+    sampling_rule = MaxStepSizeRule(1, 5e-5)
+    seqd = discretize(seq; sampling_rule)
+    t = seqd.t[1:end-1]
+    k0, _ =  KomaMRIBase.get_kspace(seqd)
+    k1, _ =  KomaMRIBase.get_M1(seqd)
+    k2, _ =  KomaMRIBase.get_M2(seqd)
+    moments = hcat(t, k0, k1, k2)
+    matwrite(joinpath(matfolder, matfilename), Dict("moments" => moments))
+end
+
+function export_2_mat_phantom(phantom, matfolder; matfilename="phantom.mat")
+    phantom_dict = Dict("name" => phantom.name,
+                "columns" => ["x", "y", "z", "rho", "T1", "T2", "T2s", "delta_omega"],
+                "data" => hcat(phantom.x, phantom.y, phantom.z, phantom.ρ, phantom.T1, phantom.T2, phantom.T2s, phantom.Δw))
+    matwrite(joinpath(matfolder, matfilename), Dict("phantom" => phantom_dict))
+end
+
+function export_2_mat_scanner(sys, matfolder; matfilename="scanner.mat")
+    sys_dict = Dict(string(name) => begin
+        component = getproperty(sys, name)
+        fields = Dict(string(field) => getproperty(component, field)
+            for field in fieldnames(typeof(component)))
+        merge(Dict("type" => string(nameof(typeof(component)))), _mat_value(fields))
+    end for name in fieldnames(Scanner))
+    matwrite(joinpath(matfolder, matfilename), Dict("scanner" => sys_dict))
+end
+
+_mat_value(value) = value
+_mat_value(value::AbstractString) = String(value)
+_mat_value(value::Symbol) = string(value)
+_mat_value(value::VersionNumber) = string(value)
+_mat_value(value::Tuple) = [_mat_value(item) for item in value]
+_mat_value(value::NamedTuple) = Dict(string(key) => _mat_value(item) for (key, item) in pairs(value))
+_mat_value(value::AbstractDict) = Dict(
+    replace(string(key), "Δ" => "d") => _mat_value(item) for (key, item) in value
+)
+_mat_value(value::AbstractArray{<:Number}) = value
+_mat_value(value::AbstractArray) = reshape(Any[_mat_value(item) for item in value], size(value))
+_mat_value(value::Union{AcquisitionHeader,EncodingCounters,Limit,MeasurementDependency,CoilDescription}) =
+    Dict(string(name) => _mat_value(getfield(value, name)) for name in fieldnames(typeof(value)))
+
+function export_2_mat_raw(raw_ismrmrd, matfolder; matfilename="raw.mat", include_params=true)
+    params = _mat_value(raw_ismrmrd.params)
+    profiles = Any[
+        Dict(
+            "head" => _mat_value(profile.head),
+            "traj" => profile.traj,
+            "data" => profile.data,
+            "role" => string(_acquisition_role(profile.head.flags)),
+        ) for profile in raw_ismrmrd.profiles
+    ]
+    matwrite(joinpath(matfolder, matfilename), Dict("raw" => Dict("params" => params, "profiles" => profiles)))
+    if include_params && haskey(params, "userParameters")
+        matwrite(joinpath(matfolder, "sim_params.mat"), params["userParameters"])
+    end
+end
+
+function _image_export(reconstruction::ReconstructionResult)
+    images = Any[
+        Dict(
+            "data" => parent(entry.image),
+            "size" => collect(size(entry.image)),
+            "labels" => _mat_value(entry.labels),
+            "source" => _mat_value(entry.source),
+            "axes_mm" => Dict(string(name) => collect(MRIReco.Unitful.ustrip.(MRIReco.Unitful.mm, axis.val))
+                for (name, axis) in zip((:x, :y, :z), AxisArrays.axes(entry.image)[1:3])),
+            "voxel_spacing_mm" => [MRIReco.Unitful.ustrip(MRIReco.Unitful.mm, step(axis.val))
+                for axis in AxisArrays.axes(entry.image)[1:3]],
+            "trajectory_scale" => get(entry, :trajectory_scale, 1),
+        ) for entry in reconstruction.images
+    ]
+    return Dict("reconstruction" => Dict("policy" => _mat_value(reconstruction.policy), "images" => images))
+end
+
+_image_export(image) = Dict("image" => image)
+
+function export_2_mat_image(image, rec_params, matfolder; matfilename="image.mat", include_params=true)
+    if include_params && haskey(rec_params, :reconSize)
+        dict_rec_params = Dict("reco" => rec_params[:reco],
+                            "Nx" => rec_params[:reconSize][1],
+                            "Ny" => rec_params[:reconSize][2])
+        matwrite(joinpath(matfolder, "rec_params.mat"), Dict("rec_params" => dict_rec_params))
+    end
+
+    matwrite(joinpath(matfolder, matfilename), _image_export(image))
+end
+
+function export_2_mat(seq, phantom, sys, raw_ismrmrd, rec_params, image, matfolder; type="all", matfilename="data.mat", include_params=true)
+    head = splitext(matfilename)[1]
+    files = String[]
+    if type=="all"
+        export_2_mat_sequence(seq, matfolder)
+        export_2_mat_kspace(seq, matfolder)
+        export_2_mat_moments(seq, matfolder)
+        export_2_mat_phantom(phantom, matfolder)
+        export_2_mat_scanner(sys, matfolder)
+        export_2_mat_raw(raw_ismrmrd, matfolder; include_params)
+        export_2_mat_image(image, rec_params, matfolder; include_params)
+    elseif type=="sequence"
+		files = [head*"_sequence.mat", head*"_kspace.mat", head*"_moments.mat"]
+		export_2_mat_sequence(seq, matfolder; matfilename=files[1])
+        export_2_mat_kspace(seq, matfolder; matfilename=files[2])
+        export_2_mat_moments(seq, matfolder; matfilename=files[3])
+	elseif type=="phantom"
+		files = [head*"_phantom.mat"]
+		export_2_mat_phantom(phantom, matfolder; matfilename=only(files))
+    elseif type=="scanner"
+		files = [head*"_scanner.mat"]
+		export_2_mat_scanner(sys, matfolder; matfilename=only(files))
+    elseif type=="raw"
+		files = [head*"_raw.mat"]
+        include_params && haskey(raw_ismrmrd.params, "userParameters") && push!(files, "sim_params.mat")
+		export_2_mat_raw(raw_ismrmrd, matfolder; matfilename=first(files), include_params)
+    elseif type=="image"
+		files = [head*"_image.mat"]
+		include_params && haskey(rec_params, :reconSize) && push!(files, "rec_params.mat")
+		export_2_mat_image(image, rec_params, matfolder; matfilename=first(files), include_params)
+	end
+
+    isempty(files) && return "<ul><li><b>Path:</b> $matfolder</li></ul>"
+    label = length(files) == 1 ? "Name" : "Names"
+    return "<ul><li><b>$label:</b> $(join(files, ", "))</li><li><b>Path:</b> $matfolder</li></ul>"
+end

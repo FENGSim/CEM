@@ -1,0 +1,185 @@
+#Simplest sim method, works for GPU and CPU but not optimized for either. Although Bloch()
+#is the simulation method chosen if none is passed, the run_spin_precession! and
+#run_spin_excitation! functions in this file are dispatched to at the most abstract level,
+#so new simulation methods will start by using these functions.
+struct BlochSimple <: SimulationMethod end
+
+export BlochSimple
+
+struct BlochSimplePrealloc{T,R} <: PreallocResult{T}
+    spin_reset::R
+end
+
+BlochSimplePrealloc(::Type{T}, spin_reset) where {T} =
+    BlochSimplePrealloc{T,typeof(spin_reset)}(spin_reset)
+
+Base.view(prealloc::BlochSimplePrealloc{T}, i::UnitRange) where {T} =
+    BlochSimplePrealloc(T, view(prealloc.spin_reset, i))
+
+function prealloc(
+    ::BlochSimple, backend::KA.Backend, obj, _M,
+    max_block_length, _max_adc_samples, _groupsize, _sys,
+)
+    return BlochSimplePrealloc(
+        eltype(obj.x),
+        prealloc_spin_reset(obj.motion, backend, length(obj), max_block_length),
+    )
+end
+
+function acquire_block_signal!(sig, Mxy, receiver, ::NoMotion, positions, _adc)
+    acquire_signal!(sig, Mxy, receiver, positions)
+    return nothing
+end
+
+function acquire_block_signal!(
+    sig, Mxy, receiver, ::Union{Motion,MotionList}, (x, y, z), adc,
+)
+    for (sample, time_index) in enumerate(adc .+ 1)
+        positions = (
+            @view(x[:, time_index]),
+            @view(y[:, time_index]),
+            @view(z[:, time_index]),
+        )
+        acquire_signal!(
+            @view(sig[sample, :]), @view(Mxy[:, sample]),
+            receiver, positions,
+        )
+    end
+    return nothing
+end
+
+"""
+    run_spin_precession(obj, seq, Xt, sig)
+
+Simulates an MRI sequence `seq` on the Phantom `obj` for time points `t`. It calculates S(t)
+= ∑ᵢ ρ(xᵢ) exp(- t/T2(xᵢ) ) exp(- 𝒊 γ ∫ Bz(xᵢ,t)). It performs the simulation in free
+precession.
+
+# Arguments
+- `obj`: (`::Phantom`) Phantom struct (actually, it's a part of the complete phantom)
+- `seq`: (`::Sequence`) Sequence struct
+
+# Returns
+- `S`: (`Vector{ComplexF64}`) raw signal over time
+- `M0`: (`::Vector{Mag}`) final state of the Mag vector
+"""
+function run_spin_precession!(
+    p::Phantom{T},
+    seq::DiscreteSequence{T},
+    sig::AbstractArray{Complex{T}},
+    M::Mag{T},
+    sys,
+    sim_method::SimulationMethod,
+    groupsize,
+    backend::KA.Backend,
+    prealloc::PreallocResult
+) where {T<:Real}
+    #Motion
+    x, y, z = get_spin_coords(p.motion, p.x, p.y, p.z, seq.t')::NTuple{3,AbstractArray{T}}
+    #Effective field
+    γ2π = T(2) * T(π) * T(γ)
+    Bz = x .* seq.Gx' .+ y .* seq.Gy' .+ z .* seq.Gz' .+ p.Δw ./ γ2π
+    #Rotation
+    if is_ADC_on(seq)
+        ϕ = -γ2π .* cumtrapz(seq.Δt', Bz)
+    else
+        ϕ = -γ2π .* trapz(seq.Δt', Bz)
+    end
+    #Mxy precession and relaxation, and Mz relaxation
+    tp   = cumsum(seq.Δt) # t' = t - t0
+    dur  = sum(seq.Δt)   # Total length, used for signal relaxation
+    Mxy  = M.xy .* exp.(-tp' ./ p.T2) .* cis.(ϕ) #This assumes Δw and T2 are constant in time
+    M.xy .= Mxy[:, end]
+    M.z  .= M.z .* exp.(-dur ./ p.T1) .+ p.ρ .* (1 .- exp.(-dur ./ p.T1))
+    #Reset Spin-State (Magnetization). Only for FlowPath
+    spin_reset = spin_reset_state(prealloc, p.motion, seq.t, backend, length(p))
+    for column in axes(Mxy, 2)
+        outflow_spin_reset_at!(
+            @view(Mxy[:, column]), spin_reset, column + 1, seq.t, p.motion,
+        )
+    end
+    outflow_spin_reset_at!(
+        M, spin_reset, lastindex(seq.t), seq.t, p.motion; replace_by=p.ρ,
+    )
+    #Acquired signal
+    adc = findall(cpu(seq.ADC[2:end]))
+    Mxy_adc = Mxy[:, adc]
+    acquire_block_signal!(
+        sig, Mxy_adc, sys.receiver, p.motion, (x, y, z), adc,
+    )
+    return nothing
+end
+
+"""
+    M0 = run_spin_excitation(obj, seq, M0)
+
+It gives rise to a rotation of `M0` with an angle given by the efective magnetic field
+(including B1, gradients and off resonance) and with respect to a rotation axis.
+
+# Arguments
+- `obj`: (`::Phantom`) Phantom struct (actually, it's a part of the complete phantom)
+- `seq`: (`::Sequence`) Sequence struct
+
+# Returns
+- `M0`: (`::Vector{Mag}`) final state of the Mag vector after a rotation (actually, it's
+    a part of the complete Mag vector and it's a part of the initial state for the next
+    precession simulation step)
+"""
+function run_spin_excitation!(
+    p::Phantom{T},
+    seq::DiscreteSequence{T},
+    sig::AbstractArray{Complex{T}},
+    M::Mag{T},
+    sys,
+    sim_method::SimulationMethod,
+    groupsize,
+    backend::KA.Backend,
+    prealloc::PreallocResult
+) where {T<:Real}
+    sample = 1
+    spin_reset = spin_reset_state(prealloc, p.motion, seq.t, backend, length(p))
+    advance_spin_reset!(spin_reset, firstindex(seq.t))
+    outflow_spin_reset!(M, spin_reset; replace_by=p.ρ)
+    # Rotating frame -> RF frame
+    ψ_start = @view seq.ψ[1:1]
+    @. M.xy = M.xy * cis(-ψ_start)
+    #Simulation
+    for i in eachindex(seq.Δt)
+        s = @views ( # This was the previous behaviour of seq[i], but it was hidden
+            t = seq.t[i, :], tnew = seq.t[i + 1, :], Δt = seq.Δt[i, :],
+            Gx = seq.Gx[i, :], Gy = seq.Gy[i, :], Gz = seq.Gz[i, :],
+            B1 = seq.B1[i, :], Δf = seq.Δf[i, :],
+            ADC = any(seq.ADC[i + 1, :])
+        )
+        #Motion
+        x, y, z = get_spin_coords(p.motion, p.x, p.y, p.z, s.t)::NTuple{3,AbstractArray{T}}
+        #Effective field
+        γ2π = T(2) * T(π) * T(γ)
+        ΔBz = p.Δw ./ γ2π .- s.Δf ./ T(γ) # ΔB_0 = (B_0 - ω_rf/γ), Need to add a component here to model scanner's dB0(x,y,z)
+        Bz = (s.Gx .* x .+ s.Gy .* y .+ s.Gz .* z) .+ ΔBz
+        B = sqrt.(abs.(s.B1) .^ 2 .+ abs.(Bz) .^ 2)
+        B .+= (B .== 0) .* eps(T)
+        #Spinor Rotation
+        φ = -γ2π .* (B .* s.Δt)
+        mul!(Q(φ, s.B1 ./ B, Bz ./ B), M)
+        #Relaxation
+        @. M.xy = M.xy * exp(-s.Δt / p.T2)
+        @. M.z  = M.z * exp(-s.Δt / p.T1) + p.ρ * (1 - exp(-s.Δt / p.T1))
+        #Reset Spin-State (Magnetization). Only for FlowPath
+        outflow_spin_reset_at!(
+            M, spin_reset, i + 1, seq.t, p.motion; replace_by=p.ρ,
+        )
+        #Acquire signal
+        # TODO: use sim_method and sys to modify sig 
+        if s.ADC # ADC at the end of the time step
+            acquire_signal!(
+                @view(sig[sample, :]), M.xy, sys.receiver, (x, y, z),
+            )
+            sample += 1
+        end
+    end
+    # RF frame -> Rotating frame
+    ψ_end = @view seq.ψ[end:end]
+    @. M.xy = M.xy * cis(ψ_end)
+    return nothing
+end

@@ -1,0 +1,169 @@
+## COV_EXCL_START
+
+@inline function rotate_magnetization(θx, θy, θz, Mxy_r, Mxy_i, Mz, ::Type{T}) where {T}
+    α_r, scale = spinor_half_angle(θx^2 + θy^2 + θz^2)
+    α_i = -θz * scale
+    β_r = θy * scale
+    β_i = -θx * scale
+
+    Mxy_new_r = 2 * (Mxy_i * (α_r * α_i - β_r * β_i) +
+                Mz * (α_i * β_i + α_r * β_r)) +
+                Mxy_r * (α_r^2 - α_i^2 - β_r^2 + β_i^2)
+    Mxy_new_i = -2 * (Mxy_r * (α_r * α_i + β_r * β_i) -
+                Mz * (α_r * β_i - α_i * β_r)) +
+                Mxy_i * (α_r^2 - α_i^2 + β_r^2 - β_i^2)
+    Mz_new = Mz * (α_r^2 + α_i^2 - β_r^2 - β_i^2) -
+             2 * (Mxy_r * (α_r * β_r - α_i * β_i) +
+             Mxy_i * (α_r * β_i + α_i * β_r))
+    return Mxy_new_r, Mxy_new_i, Mz_new
+end
+
+@inline mag_norm(::Type{T}, Mxy_r, Mxy_i, Mz) where {T} = nothing
+@inline mag_norm(::Type{Float32}, Mxy_r, Mxy_i, Mz) = sqrt(Mxy_r^2 + Mxy_i^2 + Mz^2)
+
+@inline restore_mag_norm(::Nothing, Mxy_r, Mxy_i, Mz) = Mxy_r, Mxy_i, Mz
+@inline function restore_mag_norm(M_norm::T, Mxy_r, Mxy_i, Mz) where {T<:Real}
+    M_norm_new = sqrt(Mxy_r^2 + Mxy_i^2 + Mz^2)
+    if !iszero(M_norm_new)
+        M_scale = M_norm / M_norm_new
+        Mxy_r *= M_scale
+        Mxy_i *= M_scale
+        Mz *= M_scale
+    end
+    return Mxy_r, Mxy_i, Mz
+end
+
+@kernel unsafe_indices=true inbounds=true function excitation_kernel!(
+    sig_output::AbstractMatrix{Complex{T}}, 
+    M_xy, M_z, receiver, N_coils, N_adc,
+    @Const(p_x), @Const(p_y), @Const(p_z), @Const(p_ΔBz), @Const(p_T1), @Const(p_T2), @Const(p_ρ),
+    p_first_reset, N_spins,
+    @Const(s_Gx), @Const(s_Gy), @Const(s_Gz), @Const(s_Δt), @Const(s_Δf), @Const(s_B1), @Const(s_ψ), @Const(s_ADC), s_length,
+    ::Val{MOTION}, ::Val{USE_WARP_REDUCTION}, ::Val{HAS_ADC},
+    ::Val{HAS_SENSITIVITIES},
+    sim_method::SM
+) where {
+    T, MOTION, USE_WARP_REDUCTION, HAS_ADC, HAS_SENSITIVITIES,
+    SM<:BlochLikeSimMethods,
+}
+
+    @uniform N = @groupsize()[1]
+    i_l = @index(Local, Linear)
+    i_g = @index(Group, Linear)
+    i = (i_g - 1u32) * UInt32(N) + i_l
+
+    sig_group_r =
+        @localmem T HAS_ADC ? (USE_WARP_REDUCTION && !HAS_SENSITIVITIES ? 32 : N) : 1
+    sig_group_i =
+        @localmem T HAS_ADC ? (USE_WARP_REDUCTION && !HAS_SENSITIVITIES ? 32 : N) : 1
+
+    active = i <= N_spins
+    Mxy_r = zero(T)
+    Mxy_i = zero(T)
+    Mz = zero(T)
+    ρ = zero(T)
+    ΔBz = zero(T)
+    T1 = T(1)
+    T2 = T(1)
+    x = zero(T)
+    y = zero(T)
+    z = zero(T)
+    Bx_0 = zero(T)
+    By_0 = zero(T)
+    Bz_0 = zero(T)
+    first_reset = typemax(UInt32)
+
+    if active
+        first_reset = spin_first_reset(p_first_reset, i)
+        ΔBz = p_ΔBz[i]
+        Mxy_r, Mxy_i = reim(M_xy[i])
+        Mz = M_z[i]
+        ρ = p_ρ[i]
+        T1 = p_T1[i]
+        T2 = p_T2[i]
+        Mxy_r, Mxy_i, Mz = reset_spin_state(
+            first_reset, 1u32, Mxy_r, Mxy_i, Mz, ρ,
+        )
+        # Rotating frame -> RF frame
+        # M * exp(-i * ψ)
+        ψ_start = s_ψ[1]
+        if !iszero(ψ_start)
+            sin_ψ, cos_ψ = sincos(ψ_start)
+            Mxy_r, Mxy_i = Mxy_r * cos_ψ + Mxy_i * sin_ψ, Mxy_i * cos_ψ - Mxy_r * sin_ψ
+        end
+
+        # Calculate initial B
+        x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, 1)
+        Bx_0, By_0 = reim(s_B1[1])
+        Bz_0 = x * s_Gx[1] + y * s_Gy[1] + z * s_Gz[1] + ΔBz - s_Δf[1] / T(γ)
+    end
+
+    # ADC_idx advances within each coil; reduce_signal_per_coil! adds the coil offset.
+    ADC_idx = 1u32
+    s_idx = 2u32
+    while (s_idx <= s_length)
+        if active
+            if MOTION
+                x, y, z = get_spin_coordinates(p_x, p_y, p_z, i, s_idx)
+            end
+            Bx_1, By_1 = reim(s_B1[s_idx])
+            Bz_1 = (x * s_Gx[s_idx] + y * s_Gy[s_idx] + z * s_Gz[s_idx]) + ΔBz - s_Δf[s_idx] / T(γ)
+
+            Δt = s_Δt[s_idx - 1]
+
+            θx, θy, θz = rotation_vector(Bx_0, By_0, Bz_0, Bx_1, By_1, Bz_1, Δt, sim_method)
+            M_norm = mag_norm(T, Mxy_r, Mxy_i, Mz)
+            Mxy_new_r, Mxy_new_i, Mz_new = rotate_magnetization(θx, θy, θz, Mxy_r, Mxy_i, Mz, T)
+            Mxy_new_r, Mxy_new_i, Mz_new = restore_mag_norm(M_norm, Mxy_new_r, Mxy_new_i, Mz_new) # For reduced float precision only.
+            
+            # Relaxation
+            E1 = exp(-Δt / T1)
+            E2 = exp(-Δt / T2)
+            Mxy_r = Mxy_new_r * E2
+            Mxy_i = Mxy_new_i * E2
+            Mz = Mz_new * E1 + ρ * (T(1) - E1)
+            Mxy_r, Mxy_i, Mz = reset_spin_state(
+                first_reset, s_idx, Mxy_r, Mxy_i, Mz, ρ,
+            )
+
+            Bx_0, By_0, Bz_0 = Bx_1, By_1, Bz_1
+        end
+
+        # Acquire Signal
+        if HAS_ADC && s_ADC[s_idx]
+            if HAS_SENSITIVITIES
+                reduce_signal_per_coil!(
+                    sig_output, Mxy_r, Mxy_i, receiver, sig_group_r, sig_group_i,
+                    (p_x, p_y, p_z), s_idx,
+                    i_l, i_g, ADC_idx, N_spins, N_coils, N_adc, N, T,
+                    Val(USE_WARP_REDUCTION),
+                )
+            else
+                sig_r, sig_i = reduce_signal!(
+                    Mxy_r, Mxy_i, sig_group_r, sig_group_i, i_l, N, T,
+                    Val(USE_WARP_REDUCTION),
+                )
+                if i_l == 1u32
+                    sig_output[i_g, ADC_idx] = complex(sig_r, sig_i)
+                end
+            end
+            ADC_idx += 1u32
+        end
+
+        s_idx += 1u32
+    end
+
+    if active
+        # RF frame -> Rotating frame
+        # M * exp(i * ψ)
+        ψ_end = s_ψ[s_length]
+        if !iszero(ψ_end)
+            sin_ψ, cos_ψ = sincos(ψ_end)
+            Mxy_r, Mxy_i = Mxy_r * cos_ψ - Mxy_i * sin_ψ, Mxy_r * sin_ψ + Mxy_i * cos_ψ
+        end
+        M_xy[i] = complex(Mxy_r, Mxy_i)
+        M_z[i] = Mz
+    end
+end
+
+## COV_EXCL_STOP
